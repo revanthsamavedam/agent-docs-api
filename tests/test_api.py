@@ -1,4 +1,4 @@
-"""API tests: publish, view, version history only."""
+"""API tests: publish, view, version history, and shared state."""
 
 import os
 
@@ -78,6 +78,33 @@ def test_publish_requires_current_base_and_old_version_is_immutable(client):
 
     versions = client.get(f"/v1/documents/{doc_id}/versions").json()["versions"]
     assert [v["number"] for v in versions] == [1, 2]
+
+
+def test_shared_state_is_document_scoped_not_version_scoped(client):
+    created = _create(client)
+    doc_id = created["id"]
+    v1_id = created["version"]["id"]
+
+    r = client.put(f"/v1/documents/{doc_id}/state/checklist.evidence_verified", json={"value": True})
+    assert r.status_code == 200, r.text
+    r = client.post(f"/v1/documents/{doc_id}/state", json={"patch": {"approval.status": "approved", "gone": None}})
+    assert r.status_code == 200, r.text
+    state = client.get(f"/v1/documents/{doc_id}/state").json()["state"]
+    assert state == {"approval.status": "approved", "checklist.evidence_verified": True}
+
+    # Publish v2: state survives, and changing state creates no version.
+    client.post(
+        f"/v1/documents/{doc_id}/versions",
+        json={"html": HTML_V2, "base_version_id": v1_id, "change_summary": "v2"},
+    )
+    assert client.get(f"/v1/documents/{doc_id}/state").json()["state"] == state
+    assert len(client.get(f"/v1/documents/{doc_id}/versions").json()["versions"]) == 2
+
+    # Null PUT deletes; bad key is rejected; missing doc is 404.
+    assert client.put(f"/v1/documents/{doc_id}/state/approval.status", json={"value": None}).json()["deleted"] is True
+    assert client.get(f"/v1/documents/{doc_id}/state/approval.status").status_code == 404
+    assert client.put(f"/v1/documents/{doc_id}/state/bad key!", json={"value": 1}).status_code == 400
+    assert client.get("/v1/documents/doc_missing/state").status_code == 404
 
 
 def test_not_found(client):

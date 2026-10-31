@@ -17,10 +17,35 @@ DATABASE_URL handling (current backend: SQLite):
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
+
+# Shared document state (KV), SlashDocs-style rules:
+# keys: letters/numbers/dot/underscore/colon/dash, max 128 chars;
+# values: JSON-serializable, max 64 KiB when dumped; null = delete;
+# a patch holds at most 256 keys. State is document-scoped, NOT
+# version-scoped, and changing it never creates a version.
+_KEY_RE = re.compile(r"^[A-Za-z0-9._:\-]{1,128}$")
+_MAX_VALUE_BYTES = 64 * 1024
+_MAX_PATCH_KEYS = 256
+
+
+def validate_state_key(key: str) -> None:
+    if not _KEY_RE.match(key):
+        raise ValueError("invalid_state_key")
+
+
+def validate_state_value(value) -> None:
+    try:
+        dumped = json.dumps(value)
+    except (TypeError, ValueError):
+        raise ValueError("state_value_not_json")
+    if len(dumped.encode("utf-8")) > _MAX_VALUE_BYTES:
+        raise ValueError("state_value_too_large")
 
 
 def _sqlite_path_from_database_url(database_url: str | None) -> str:
@@ -101,6 +126,14 @@ class Store:
                     actor TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     UNIQUE (document_id, number)
+                );
+                CREATE TABLE IF NOT EXISTS document_kv (
+                    document_id TEXT NOT NULL REFERENCES documents(id),
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (document_id, key)
                 );
                 """
             )
@@ -235,6 +268,63 @@ class Store:
                 (doc_id, version_id),
             ).fetchone()
         return self._row_to_version(row) if row else None
+
+    # -- shared document state (KV) ----------------------------------
+    def get_state(self, doc_id: str) -> dict:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM document_kv WHERE document_id = ? ORDER BY key",
+                (doc_id,),
+            ).fetchall()
+        return {r["key"]: json.loads(r["value"]) for r in rows}
+
+    def get_state_value(self, doc_id: str, key: str):
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM document_kv WHERE document_id = ? AND key = ?",
+                (doc_id, key),
+            ).fetchone()
+        return json.loads(row["value"]) if row else None
+
+    def set_state_value(self, doc_id: str, key: str, value, actor: str) -> bool:
+        """Set one key; a null value deletes it. Returns True if a key remains."""
+        validate_state_key(key)
+        if value is None:
+            # Null deletes; the key does NOT remain, so return False.
+            self.delete_state_value(doc_id, key)
+            return False
+        validate_state_value(value)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO document_kv (document_id, key, value, actor, updated_at)
+                VALUES (?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(document_id, key) DO UPDATE SET
+                    value = excluded.value, actor = excluded.actor,
+                    updated_at = datetime('now')
+                """,
+                (doc_id, key, json.dumps(value), actor),
+            )
+        return True
+
+    def delete_state_value(self, doc_id: str, key: str) -> bool:
+        validate_state_key(key)
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM document_kv WHERE document_id = ? AND key = ?",
+                (doc_id, key),
+            )
+            # Capture inside the block: rowcount is lost once the
+            # connection context closes the cursor.
+            deleted = cur.rowcount > 0
+        return deleted
+
+    def patch_state(self, doc_id: str, patch: dict, actor: str) -> dict:
+        if len(patch) > _MAX_PATCH_KEYS:
+            raise ValueError("state_patch_too_large")
+        for key, value in patch.items():
+            self.set_state_value(doc_id, key, value, actor)
+        return self.get_state(doc_id)
 
     @staticmethod
     def _row_to_version(row: sqlite3.Row) -> Version:

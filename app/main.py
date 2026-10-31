@@ -1,8 +1,12 @@
-"""agent-docs API: publish, view, and version history only.
+"""agent-docs API: publish, view, version history, and shared state.
 
 Documents are plain, self-contained HTML written by the agent.
-No comments, reactions, mentions, notifications, shared state,
-grants UI, or approvals UI exist in this service.
+Shared document state is a document-scoped key-value store
+(SlashDocs-style): it survives across versions, changing it
+never creates a version, and document JavaScript reads/writes
+it through the viewer's bridge. No comments, reactions,
+mentions, notifications, grants UI, or approvals UI exist in
+this service.
 
 Auth is a placeholder seam only: the caller may send an
 Authorization header, which is passed through as ``actor`` and
@@ -25,7 +29,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from .store import Store, get_store
+from .store import Store, get_store, validate_state_key, validate_state_value
 
 MAX_HTML_BYTES = 10 * 1024 * 1024
 
@@ -82,6 +86,15 @@ class PublishVersionRequest(BaseModel):
     html: str = Field(min_length=1)
     base_version_id: str = Field(min_length=1)
     change_summary: str = ""
+
+
+class SetStateRequest(BaseModel):
+    # Any JSON value; null deletes the key (SlashDocs sentinel).
+    value: object = None
+
+
+class PatchStateRequest(BaseModel):
+    patch: dict
 
 
 def _check_html_size(html: str) -> None:
@@ -170,6 +183,69 @@ def get_version_html(doc_id: str, version_id: str):
         raise HTTPException(status_code=404, detail="version_not_found")
     # Byte-identical raw HTML. No wrapping, no rewriting.
     return Response(content=version.html, media_type="text/html")
+
+
+def _require_document(doc_id: str) -> None:
+    if store().get_document(doc_id) is None:
+        raise HTTPException(status_code=404, detail="document_not_found")
+
+
+@app.get("/v1/documents/{doc_id}/state")
+def get_state(doc_id: str):
+    _require_document(doc_id)
+    return {"document_id": doc_id, "state": store().get_state(doc_id)}
+
+
+@app.post("/v1/documents/{doc_id}/state")
+def patch_state(
+    doc_id: str,
+    req: PatchStateRequest,
+    authorization: str | None = Header(default=None),
+):
+    _require_document(doc_id)
+    try:
+        state = store().patch_state(doc_id, req.patch, _actor(authorization))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"document_id": doc_id, "state": state}
+
+
+@app.put("/v1/documents/{doc_id}/state/{key}")
+def set_state(
+    doc_id: str,
+    key: str,
+    req: SetStateRequest,
+    authorization: str | None = Header(default=None),
+):
+    _require_document(doc_id)
+    try:
+        kept = store().set_state_value(doc_id, key, req.value, _actor(authorization))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"document_id": doc_id, "key": key, "deleted": not kept}
+
+
+@app.get("/v1/documents/{doc_id}/state/{key}")
+def get_state_value(doc_id: str, key: str):
+    _require_document(doc_id)
+    try:
+        validate_state_key(key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    value = store().get_state_value(doc_id, key)
+    if value is None:
+        raise HTTPException(status_code=404, detail="state_key_not_found")
+    return {"document_id": doc_id, "key": key, "value": value}
+
+
+@app.delete("/v1/documents/{doc_id}/state/{key}")
+def delete_state(doc_id: str, key: str):
+    _require_document(doc_id)
+    try:
+        deleted = store().delete_state_value(doc_id, key)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"document_id": doc_id, "key": key, "deleted": deleted}
 
 
 def main() -> None:

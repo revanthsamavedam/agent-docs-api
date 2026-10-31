@@ -4,12 +4,18 @@ Python (FastAPI) backend for agent-docs. Separate repo — it does not
 import code from the cli, mcp, or ui repos, and they do not import
 code from it. They talk to it over HTTP.
 
-## Scope — publish, view, and version history only
+## Scope — publish, view, version history, and shared state
 
 - Agents publish plain, self-contained HTML documents.
 - Humans view documents and any past version.
-- No comments, reactions, mentions, notifications, shared state,
-  grants UI, or approvals UI.
+- Shared document state: a document-scoped key-value store.
+  State survives across versions and changing it never creates
+  a version. Keys match `[A-Za-z0-9._:-]{1,128}`, values are
+  JSON up to 64 KiB, and a null value deletes a key.
+  Document JavaScript reads/writes it via the viewer's bridge
+  (`window.agentdocs.kv`).
+- No comments, reactions, mentions, notifications, grants UI,
+  or approvals UI.
 
 Documents are never React/JSX. React is viewer chrome only, in the
 ui repo.
@@ -68,6 +74,13 @@ python -m venv .venv
 - `GET /v1/documents/{id}/versions/{version_id}/html` — raw HTML,
   byte-identical to what was published.
 - `GET /health` — liveness check.
+- `GET /v1/documents/{id}/state` — all shared state for a document.
+- `PUT /v1/documents/{id}/state/{key}` — set one key (`{"value": …}`;
+  null deletes the key).
+- `GET /v1/documents/{id}/state/{key}` — one key's value.
+- `DELETE /v1/documents/{id}/state/{key}` — delete one key.
+- `POST /v1/documents/{id}/state` — patch many keys at once
+  (`{"patch": {…}}`; null values in the patch delete those keys).
 
 Versions are immutable, carry a SHA-256 of the HTML, and a
 change summary. HTML larger than 10 MiB is rejected (413).
