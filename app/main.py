@@ -10,6 +10,11 @@ stored for audit. It is NOT verified against any identity
 provider here. The deployer wires real identity/authorization
 in front of this service; that integration is deliberately out
 of this repo, and no identity provider is named or integrated here.
+
+The JWT token URL is set in code below (JWT_TOKEN_URL), matching
+the CLI's TOKEN_URL. It is NOT a user-facing option or env var:
+the maintainer replaces it in code before deployment, and end
+users never configure it.
 """
 
 from __future__ import annotations
@@ -23,6 +28,13 @@ from pydantic import BaseModel, Field
 from .store import Store, get_store
 
 MAX_HTML_BYTES = 10 * 1024 * 1024
+
+# JWT token URL, set in code — not a user option, not an env var.
+# MAINTAINER: replace this value with the real token URL before
+# deployment, matching the CLI's TOKEN_URL. End users must never
+# be asked to set it. Token verification itself is the deployer's
+# wiring and is deliberately not implemented here.
+JWT_TOKEN_URL = "REPLACE_ME_WITH_JWT_TOKEN_URL"
 
 app = FastAPI(title="agent-docs API", version="0.1.0")
 _store: Store | None = None
