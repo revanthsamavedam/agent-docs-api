@@ -40,6 +40,11 @@ an opaque `actor` string. It is **not verified against any identity
 provider here**. The deployer wires real identity/authorization in
 front of this service. Do not put real credentials in this repo.
 
+The JWT token URL is `JWT_TOKEN_URL` in `app/main.py`, set in code
+by the maintainer before deployment, matching the CLI's `TOKEN_URL`.
+It is deliberately not a user-facing option or environment variable:
+end users never configure it.
+
 ## Run
 
 ```
