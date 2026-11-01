@@ -82,6 +82,27 @@ python -m venv .venv
 - `POST /v1/documents/{id}/state` — patch many keys at once
   (`{"patch": {…}}`; null values in the patch delete those keys).
 
+## Drafts — test on the actual viewer link before publishing
+
+A draft is an unpublished HTML snapshot for a document. It
+creates no version, appears in no version list, and saving one
+touches no published version. It is rendered in the viewer
+through the same bridge as a published version, so live data,
+state, and navigation all work while testing.
+
+- `POST /v1/documents` with `{"draft": true}` — create a
+  draft-only document (no version yet).
+- `PUT /v1/documents/{id}/draft` — save/replace a draft.
+  Validated exactly like a publish; a rejected draft stores
+  nothing.
+- `GET /v1/documents/{id}/draft` — the stored draft HTML.
+- `DELETE /v1/documents/{id}/draft` — discard a draft.
+- `POST /v1/documents/{id}/draft/publish` — publish the draft
+  as the next version (version 1 for a draft-only document);
+  clears the draft. A direct publish also clears any draft.
+- Viewer link: `?doc=<id>&draft=1`. The document list and
+  `GET /v1/documents/{id}` report `has_draft`.
+
 ## Publish-time validation — the deterministic gate
 
 Copilot instructions are guidance, not enforcement: an agent

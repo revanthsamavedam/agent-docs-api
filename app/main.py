@@ -105,6 +105,18 @@ class CreateDocumentRequest(BaseModel):
     title: str = Field(min_length=1)
     html: str = Field(min_length=1)
     change_summary: str = ""
+    # draft=True creates a draft-only document: no version yet,
+    # viewable on the actual viewer link (?doc=<id>&draft=1)
+    # until it is published via POST /v1/documents/{id}/draft/publish.
+    draft: bool = False
+
+
+class SaveDraftRequest(BaseModel):
+    html: str = Field(min_length=1)
+
+
+class PublishDraftRequest(BaseModel):
+    change_summary: str = ""
 
 
 class PublishVersionRequest(BaseModel):
@@ -154,10 +166,64 @@ def create_document(
     authorization: str | None = Header(default=None),
 ):
     _validate_html_or_400(req.html)
+    if req.draft:
+        doc = store().create_draft_document(req.title, req.html, _user_id(authorization))
+        return {"id": doc.id, "title": doc.title, "draft": True, "version": None}
     doc, version = store().create_document(
         req.title, req.html, req.change_summary, _user_id(authorization)
     )
     return {"id": doc.id, "title": doc.title, "version": _version_dict(version)}
+
+
+@app.put("/v1/documents/{doc_id}/draft")
+def save_draft(
+    doc_id: str,
+    req: SaveDraftRequest,
+    authorization: str | None = Header(default=None),
+):
+    """Save an unpublished draft for a document.
+
+    Validated exactly like a publish, but creates no version
+    and touches no published version. View it on the actual
+    viewer link: ?doc=<id>&draft=1.
+    """
+    if store().get_document(doc_id) is None:
+        raise HTTPException(status_code=404, detail="document_not_found")
+    _validate_html_or_400(req.html)
+    store().set_draft(doc_id, req.html)
+    return {"id": doc_id, "draft": True}
+
+
+@app.get("/v1/documents/{doc_id}/draft")
+def get_draft(doc_id: str):
+    if store().get_document(doc_id) is None:
+        raise HTTPException(status_code=404, detail="document_not_found")
+    html = store().get_draft(doc_id)
+    if html is None:
+        raise HTTPException(status_code=404, detail="draft_not_found")
+    return {"id": doc_id, "draft": True, "html": html}
+
+
+@app.delete("/v1/documents/{doc_id}/draft")
+def delete_draft(doc_id: str):
+    if store().get_document(doc_id) is None:
+        raise HTTPException(status_code=404, detail="document_not_found")
+    return {"id": doc_id, "deleted": store().delete_draft(doc_id)}
+
+
+@app.post("/v1/documents/{doc_id}/draft/publish", status_code=201)
+def publish_draft(
+    doc_id: str,
+    req: PublishDraftRequest,
+    authorization: str | None = Header(default=None),
+):
+    """Publish the stored draft as the next version; clears it."""
+    if store().get_document(doc_id) is None:
+        raise HTTPException(status_code=404, detail="document_not_found")
+    version = store().publish_draft(doc_id, req.change_summary, _user_id(authorization))
+    if version is None:
+        raise HTTPException(status_code=404, detail="draft_not_found")
+    return {"version": _version_dict(version)}
 
 
 @app.get("/v1/documents")
@@ -175,6 +241,7 @@ def get_document(doc_id: str):
         "id": doc.id,
         "title": doc.title,
         "latest_version": _version_dict(latest) if latest else None,
+        "has_draft": store().has_draft(doc_id),
     }
 
 
@@ -199,6 +266,8 @@ def publish_version(
                 "current_version_id": current,
             },
         )
+    # A direct publish supersedes any stored draft.
+    store().delete_draft(doc_id)
     return {"version": _version_dict(version)}
 
 

@@ -241,6 +241,42 @@ def test_publish_validation_allows_sample_pages_and_blocks_bad_new_version(clien
     assert len(client.get(f"/v1/documents/{doc_id}/versions").json()["versions"]) == 1
 
 
+def test_draft_save_view_publish_on_actual_link(client):
+    created = _create(client)
+    doc_id = created["id"]
+    v1_id = created["version"]["id"]
+    # Saving a draft creates no version and touches no published version.
+    r = client.put(f"/v1/documents/{doc_id}/draft", json={"html": HTML_V2})
+    assert r.status_code == 200, r.text
+    assert len(client.get(f"/v1/documents/{doc_id}/versions").json()["versions"]) == 1
+    assert client.get(f"/v1/documents/{doc_id}/versions/{v1_id}/html").text == HTML_V1
+    assert client.get(f"/v1/documents/{doc_id}/draft").json()["html"] == HTML_V2
+    assert client.get(f"/v1/documents/{doc_id}").json()["has_draft"] is True
+    # A draft with a secret is rejected by the same validation as a publish.
+    r = client.put(f"/v1/documents/{doc_id}/draft", json={"html": "<html><script>const api_key = \"abc12345\";</script></html>"})
+    assert r.status_code == 400
+    assert client.get(f"/v1/documents/{doc_id}/draft").json()["html"] == HTML_V2
+    # Publish the draft: it becomes v2, and the draft is cleared.
+    r = client.post(f"/v1/documents/{doc_id}/draft/publish", json={"change_summary": "from draft"})
+    assert r.status_code == 201, r.text
+    assert r.json()["version"]["number"] == 2
+    assert client.get(f"/v1/documents/{doc_id}/draft").status_code == 404
+    assert client.get(f"/v1/documents/{doc_id}").json()["has_draft"] is False
+
+
+def test_draft_only_document_then_publish(client):
+    r = client.post("/v1/documents", json={"title": "Draft page", "html": HTML_V1, "draft": True})
+    assert r.status_code == 201, r.text
+    doc_id = r.json()["id"]
+    assert r.json()["draft"] is True and r.json()["version"] is None
+    assert client.get(f"/v1/documents/{doc_id}/versions").json()["versions"] == []
+    docs = client.get("/v1/documents").json()["documents"]
+    assert [d for d in docs if d["id"] == doc_id][0]["has_draft"] is True
+    r = client.post(f"/v1/documents/{doc_id}/draft/publish", json={})
+    assert r.status_code == 201 and r.json()["version"]["number"] == 1
+    assert client.post(f"/v1/documents/{doc_id}/draft/publish", json={}).status_code == 404
+
+
 def test_no_document_size_cap(client):
     # No 10 MiB cap: an 11 MiB document must be accepted, not 413.
     html = "<html>" + "x" * (11 * 1024 * 1024) + "</html>"
