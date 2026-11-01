@@ -34,6 +34,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .store import Store, get_store, validate_state_key, validate_state_value
+from .validate_html import validate_document_html
 from typing import Optional
 
 # No document size cap, by design: a document's HTML is stored as-is,
@@ -71,6 +72,22 @@ def _user_id(authorization: str | None) -> str:
     if not authorization:
         return "anonymous"
     return authorization.removeprefix("Bearer ").strip() or "anonymous"
+
+
+def _validate_html_or_400(html: str) -> None:
+    """Publish-time validation gate (create + publish).
+
+    Rejects with specific violation codes so the author or
+    Copilot can fix the exact problem and republish. Runs
+    before any version is stored, so a rejected publish leaves
+    the document and its version history untouched.
+    """
+    violations = validate_document_html(html)
+    if violations:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "html_validation_failed", "violations": violations},
+        )
 
 
 def _version_dict(v) -> dict:
@@ -136,6 +153,7 @@ def create_document(
     req: CreateDocumentRequest,
     authorization: str | None = Header(default=None),
 ):
+    _validate_html_or_400(req.html)
     doc, version = store().create_document(
         req.title, req.html, req.change_summary, _user_id(authorization)
     )
@@ -168,6 +186,7 @@ def publish_version(
 ):
     if store().get_document(doc_id) is None:
         raise HTTPException(status_code=404, detail="document_not_found")
+    _validate_html_or_400(req.html)
     version, current = store().publish_version(
         doc_id, req.html, req.base_version_id, req.change_summary,
         _user_id(authorization),

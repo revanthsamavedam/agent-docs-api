@@ -82,6 +82,37 @@ python -m venv .venv
 - `POST /v1/documents/{id}/state` — patch many keys at once
   (`{"patch": {…}}`; null values in the patch delete those keys).
 
+## Publish-time validation — the deterministic gate
+
+Copilot instructions are guidance, not enforcement: an agent
+can ignore them, and a publish via the CLI bypasses Copilot
+entirely. So `POST /v1/documents` and
+`POST /v1/documents/{id}/versions` both validate the HTML
+before anything is stored, and a rejected publish leaves the
+document and its version history untouched. Rejection is 400
+`html_validation_failed` with a list of violation codes, so
+the author fixes the exact problem and republishes:
+
+- `secret_detected` — private key, bearer token, JWT, or a
+  secret assignment (`api_key`, `client_secret`, `access_token`,
+  `refresh_token`, `private_key`). Violation messages never
+  echo matched content back.
+- `token_url_in_html` — a token URL or `tokenUrl` identifier;
+  token URLs live in the registry, never in a document.
+- `direct_fetch` — direct `fetch()`, `XMLHttpRequest`, axios,
+  or WebSocket; live data goes only via `apiFetch`.
+- `external_resource` — external scripts, stylesheets,
+  images, iframes, media, form actions, CSS imports, or JS
+  module imports; documents are self-contained.
+- `react_import` — React imports / `createElement`; documents
+  are plain HTML.
+
+Deliberately NOT rejected: `apiFetch` to an app that is not
+registered yet, so pages that fall back to sample data (or a
+403 notice) when an app is unregistered still publish. Plain
+`<a href>` links are also allowed; only resource loads are
+blocked.
+
 ## API registry — onboard an internal API once, use it in any document
 
 Register an API's base URL and its per-endpoint token URL; the
