@@ -201,6 +201,46 @@ def test_api_registry_user_id_migrated_from_old_actor(tmp_path):
     assert store.get_api("legacy")["user_id"] == "old-user"
 
 
+def test_publish_validation_rejects_secrets_direct_fetch_external_and_react(client):
+    bad_cases = {
+        "secret_detected": "<html><body><script>const k = 'sk-live-1234567890abcdef'; const api_key = \"abc12345\";</script></body></html>",
+        "direct_fetch": "<html><body><script>fetch('https://internal.example/api/reports').then(r => r.json());</script></body></html>",
+        "external_resource": "<html><head><script src=\"https://cdn.example/lib.js\"></script></head><body>hi</body></html>",
+        "token_url_in_html": "<html><body><script>const u = 'https://internal.example/oauth/token';</script></body></html>",
+        "react_import": "<html><body><script type=\"module\">import React from 'react';</script></body></html>",
+    }
+    for code, html in bad_cases.items():
+        r = client.post("/v1/documents", json={"title": "Bad", "html": html})
+        assert r.status_code == 400, (code, r.text)
+        detail = r.json()["detail"]
+        assert detail["error"] == "html_validation_failed", detail
+        assert code in [v["code"] for v in detail["violations"]], detail
+        # The error must not echo the secret back.
+        assert "sk-live" not in r.text and "abc12345" not in r.text
+    # Nothing was stored by any rejected publish.
+    assert client.get("/v1/documents").json()["documents"] == []
+
+
+def test_publish_validation_allows_sample_pages_and_blocks_bad_new_version(client):
+    from pathlib import Path
+
+    sample = Path(__file__).parent.parent.parent / "agent-docs-sample-site"
+    for name in ("home.html", "reports.html", "risks.html", "beautiful.html"):
+        html = (sample / name).read_text(encoding="utf-8")
+        r = client.post("/v1/documents", json={"title": name, "html": html})
+        assert r.status_code == 201, (name, r.text)
+    # A bad new version is rejected and leaves v1 untouched.
+    doc_id = client.get("/v1/documents").json()["documents"][0]["id"]
+    versions = client.get(f"/v1/documents/{doc_id}/versions").json()["versions"]
+    v1_id = versions[0]["id"]
+    r = client.post(
+        f"/v1/documents/{doc_id}/versions",
+        json={"html": "<html><body><script>fetch('https://x.example/');</script></body></html>", "base_version_id": v1_id},
+    )
+    assert r.status_code == 400
+    assert len(client.get(f"/v1/documents/{doc_id}/versions").json()["versions"]) == 1
+
+
 def test_no_document_size_cap(client):
     # No 10 MiB cap: an 11 MiB document must be accepted, not 413.
     html = "<html>" + "x" * (11 * 1024 * 1024) + "</html>"
