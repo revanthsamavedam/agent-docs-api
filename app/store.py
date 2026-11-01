@@ -24,10 +24,14 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 
-# API registry: name -> (api_url, token_url, scope). Names are
-# slugs; URLs must be https (http only for localhost dev). The
-# registry stores URLs only — never tokens or secrets. A token
-# URL is fetched at view time, per viewer, per endpoint.
+# API registry: app short name -> (api_url, token_url, scope,
+# swagger_url, endpoints). The app short name (e.g. "refdp") is
+# the registry key; endpoints are paths from its Swagger doc.
+# Names are slugs; URLs must be https (http only for localhost
+# dev). The registry stores URLs only — never tokens or secrets.
+# A token URL is fetched at view time, per viewer, per endpoint.
+# swagger_url is stored in the app config so a later sync can
+# fetch the latest Swagger without the caller re-supplying it.
 _API_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,63}$")
 
 
@@ -165,6 +169,17 @@ class Store:
                 );
                 """
             )
+            # Lightweight migration for DBs created before app/swagger
+            # columns existed: add them if missing, keep existing rows.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(apis)").fetchall()}
+            for col, ddl in [
+                ("app", "TEXT NOT NULL DEFAULT ''"),
+                ("swagger_url", "TEXT NOT NULL DEFAULT ''"),
+                ("endpoints", "TEXT NOT NULL DEFAULT '[]'"),
+            ]:
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE apis ADD COLUMN {col} {ddl}")
+            conn.execute("UPDATE apis SET app = name WHERE app = ''")
 
     # -- documents -----------------------------------------------------
     def create_document(
@@ -355,21 +370,26 @@ class Store:
         return self.get_state(doc_id)
 
     # -- API registry --------------------------------------------------
-    def register_api(self, name: str, api_url: str, token_url: str, scope: str, actor: str) -> dict | None:
+    def register_api(self, name: str, api_url: str, token_url: str, scope: str, actor: str, app: str | None = None, swagger_url: str | None = None) -> dict | None:
         validate_api_registration(name, api_url, token_url)
+        if app is not None and not _API_NAME_RE.match(app):
+            raise ValueError("invalid_api_name")
         try:
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT INTO apis (name, api_url, token_url, scope, actor) VALUES (?, ?, ?, ?, ?)",
-                    (name, api_url, token_url, scope or "", actor),
+                    "INSERT INTO apis (name, api_url, token_url, scope, actor, app, swagger_url, endpoints) VALUES (?, ?, ?, ?, ?, ?, ?, '[]')",
+                    (name, api_url, token_url, scope or "", actor, app or name, swagger_url or ""),
                 )
         except sqlite3.IntegrityError:
             return None
         return self.get_api(name)
 
-    def list_apis(self) -> list[dict]:
+    def list_apis(self, app: str | None = None) -> list[dict]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM apis ORDER BY name").fetchall()
+            if app:
+                rows = conn.execute("SELECT * FROM apis WHERE app = ? ORDER BY name", (app,)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM apis ORDER BY name").fetchall()
         return [dict(r) for r in rows]
 
     def get_api(self, name: str) -> dict | None:
@@ -377,7 +397,7 @@ class Store:
             row = conn.execute("SELECT * FROM apis WHERE name = ?", (name,)).fetchone()
         return dict(row) if row else None
 
-    def update_api(self, name: str, api_url: str | None, token_url: str | None, scope: str | None) -> dict | None:
+    def update_api(self, name: str, api_url: str | None, token_url: str | None, scope: str | None, app: str | None = None, swagger_url: str | None = None, endpoints: list[str] | None = None) -> dict | None:
         existing = self.get_api(name)
         if existing is None:
             return None
@@ -387,10 +407,18 @@ class Store:
         with self._connect() as conn:
             conn.execute(
                 """
-                UPDATE apis SET api_url = ?, token_url = ?, scope = ?, updated_at = datetime('now')
+                UPDATE apis SET api_url = ?, token_url = ?, scope = ?, app = ?, swagger_url = ?, endpoints = ?, updated_at = datetime('now')
                 WHERE name = ?
                 """,
-                (new_api_url, new_token_url, scope if scope is not None else existing["scope"], name),
+                (
+                    new_api_url,
+                    new_token_url,
+                    scope if scope is not None else existing["scope"],
+                    app if app is not None else existing.get("app") or name,
+                    swagger_url if swagger_url is not None else existing.get("swagger_url") or "",
+                    json.dumps(endpoints) if endpoints is not None else existing.get("endpoints") or "[]",
+                    name,
+                ),
             )
         return self.get_api(name)
 
