@@ -170,6 +170,13 @@ def test_api_sync_from_stored_swagger_url(client, monkeypatch):
     assert r.json()["unchanged_endpoints"] == ["/reports"]
 
 
+def test_no_document_size_cap(client):
+    # No 10 MiB cap: an 11 MiB document must be accepted, not 413.
+    html = "<html>" + "x" * (11 * 1024 * 1024) + "</html>"
+    r = client.post("/v1/documents", json={"title": "Big", "html": html, "change_summary": "big"})
+    assert r.status_code == 201, r.status_code
+
+
 def test_not_found(client):
     assert client.get("/v1/documents/doc_missing").status_code == 404
     assert client.get(

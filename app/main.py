@@ -32,8 +32,10 @@ from pydantic import BaseModel, Field
 from .store import Store, get_store, validate_state_key, validate_state_value
 from typing import Optional
 
-MAX_HTML_BYTES = 10 * 1024 * 1024
-
+# No document size cap, by design: a document's HTML is stored as-is,
+# however large. Storage is bounded only by the database / disk, not
+# by this API. A deployer who wants a limit should enforce it at the
+# reverse proxy, not here.
 # JWT token URL, set in code — not a user option, not an env var.
 # MAINTAINER: replace this value with the real token URL before
 # deployment, matching the CLI's TOKEN_URL. End users must never
@@ -119,11 +121,6 @@ class SyncApiRequest(BaseModel):
     swagger_url: Optional[str] = None
 
 
-def _check_html_size(html: str) -> None:
-    if len(html.encode("utf-8")) > MAX_HTML_BYTES:
-        raise HTTPException(status_code=413, detail="html_too_large")
-
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -134,7 +131,6 @@ def create_document(
     req: CreateDocumentRequest,
     authorization: str | None = Header(default=None),
 ):
-    _check_html_size(req.html)
     doc, version = store().create_document(
         req.title, req.html, req.change_summary, _actor(authorization)
     )
@@ -165,7 +161,6 @@ def publish_version(
     req: PublishVersionRequest,
     authorization: str | None = Header(default=None),
 ):
-    _check_html_size(req.html)
     if store().get_document(doc_id) is None:
         raise HTTPException(status_code=404, detail="document_not_found")
     version, current = store().publish_version(

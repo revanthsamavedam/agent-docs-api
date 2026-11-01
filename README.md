@@ -115,7 +115,9 @@ Before production, set `TRUSTED_TOKEN_URL_ORIGINS` in
 this build, meaning no origin restriction is enforced.
 
 Versions are immutable, carry a SHA-256 of the HTML, and a
-change summary. HTML larger than 10 MiB is rejected (413).
+change summary. There is no document size cap in this API:
+HTML is stored as-is, however large; storage is bounded only
+by the database / disk.
 
 ## Tests
 
