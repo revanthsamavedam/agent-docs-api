@@ -30,6 +30,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from .store import Store, get_store, validate_state_key, validate_state_value
+from typing import Optional
 
 MAX_HTML_BYTES = 10 * 1024 * 1024
 
@@ -95,6 +96,19 @@ class SetStateRequest(BaseModel):
 
 class PatchStateRequest(BaseModel):
     patch: dict
+
+
+class RegisterApiRequest(BaseModel):
+    name: str = Field(min_length=1)
+    api_url: str = Field(min_length=1)
+    token_url: str = Field(min_length=1)
+    scope: str = ""
+
+
+class UpdateApiRequest(BaseModel):
+    api_url: Optional[str] = None
+    token_url: Optional[str] = None
+    scope: Optional[str] = None
 
 
 def _check_html_size(html: str) -> None:
@@ -185,9 +199,71 @@ def get_version_html(doc_id: str, version_id: str):
     return Response(content=version.html, media_type="text/html")
 
 
+# Trusted token-URL origins, set in code by the maintainer before
+# production (empty = no origin restriction in this build, for
+# local onboarding; production deployments should list the
+# internal domains / Entra tenant allowed here and reject others).
+TRUSTED_TOKEN_URL_ORIGINS: list[str] = []
+
+
+def _check_token_url_origin(token_url: str) -> None:
+    if not TRUSTED_TOKEN_URL_ORIGINS:
+        return
+    from urllib.parse import urlparse
+
+    origin = urlparse(token_url).netloc
+    if origin not in TRUSTED_TOKEN_URL_ORIGINS:
+        raise HTTPException(status_code=400, detail="token_url_origin_not_trusted")
+
+
 def _require_document(doc_id: str) -> None:
     if store().get_document(doc_id) is None:
         raise HTTPException(status_code=404, detail="document_not_found")
+
+
+@app.post("/v1/apis", status_code=201)
+def register_api(
+    req: RegisterApiRequest,
+    authorization: str | None = Header(default=None),
+):
+    _check_token_url_origin(req.token_url)
+    try:
+        api = store().register_api(req.name, req.api_url, req.token_url, req.scope, _actor(authorization))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if api is None:
+        raise HTTPException(status_code=409, detail="api_already_registered")
+    return {"api": api}
+
+
+@app.get("/v1/apis")
+def list_apis():
+    return {"apis": store().list_apis()}
+
+
+@app.get("/v1/apis/{name}")
+def get_api(name: str):
+    api = store().get_api(name)
+    if api is None:
+        raise HTTPException(status_code=404, detail="api_not_found")
+    return {"api": api}
+
+
+@app.put("/v1/apis/{name}")
+def update_api(name: str, req: UpdateApiRequest):
+    _check_token_url_origin(req.token_url) if req.token_url else None
+    try:
+        api = store().update_api(name, req.api_url, req.token_url, req.scope)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if api is None:
+        raise HTTPException(status_code=404, detail="api_not_found")
+    return {"api": api}
+
+
+@app.delete("/v1/apis/{name}")
+def delete_api(name: str):
+    return {"name": name, "deleted": store().delete_api(name)}
 
 
 @app.get("/v1/documents/{doc_id}/state")

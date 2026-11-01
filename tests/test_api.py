@@ -107,6 +107,29 @@ def test_shared_state_is_document_scoped_not_version_scoped(client):
     assert client.get("/v1/documents/doc_missing/state").status_code == 404
 
 
+def test_api_registry_register_list_update_delete(client):
+    r = client.post("/v1/apis", json={"name": "reports", "api_url": "https://internal-a.example/api/", "token_url": "https://internal-a.example/token", "scope": "reports.read"})
+    assert r.status_code == 201, r.text
+    assert r.json()["api"]["name"] == "reports"
+    # Duplicate name -> 409; bad name / non-https URL -> 400.
+    assert client.post("/v1/apis", json={"name": "reports", "api_url": "https://x.example/", "token_url": "https://x.example/token"}).status_code == 409
+    assert client.post("/v1/apis", json={"name": "Bad Name", "api_url": "https://x.example/", "token_url": "https://x.example/token"}).status_code == 400
+    assert client.post("/v1/apis", json={"name": "x", "api_url": "http://x.example/", "token_url": "https://x.example/token"}).status_code == 400
+
+    apis = client.get("/v1/apis").json()["apis"]
+    assert [a["name"] for a in apis] == ["reports"]
+    assert client.get("/v1/apis/reports").json()["api"]["token_url"] == "https://internal-a.example/token"
+
+    # Rotating a token URL does not require republishing documents:
+    # the registry is resolved at view time.
+    r = client.put("/v1/apis/reports", json={"token_url": "https://internal-a.example/new-token"})
+    assert r.status_code == 200 and r.json()["api"]["token_url"] == "https://internal-a.example/new-token"
+    assert client.put("/v1/apis/missing", json={"token_url": "https://x.example/token"}).status_code == 404
+
+    assert client.delete("/v1/apis/reports").json()["deleted"] is True
+    assert client.get("/v1/apis/reports").status_code == 404
+
+
 def test_not_found(client):
     assert client.get("/v1/documents/doc_missing").status_code == 404
     assert client.get(
