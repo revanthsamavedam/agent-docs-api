@@ -4,14 +4,14 @@ The repository interface is the seam for the Postgres target: a future
 PostgresStore would implement the same methods and be selected from
 DATABASE_URL, with no endpoint code changing.
 
-DATABASE_URL handling (current backend: SQLite):
+DATABASE_URL handling:
   - unset            -> ./agentdocs.db next to the working directory
   - sqlite:///path   -> that file
   - sqlite:///:memory: -> in-memory (tests)
   - a plain path     -> that file
-  - postgresql://... -> RuntimeError: Postgres backend is not implemented
-    yet; SQLite is the current backend. This is deliberate: the store
-    must not silently pretend a Postgres URL is being honoured.
+  - postgresql://... -> PostgresStore (app/postgres_store.py,
+    schema in app/postgres_schema.sql; needs psycopg, see the
+    [postgres] extra in pyproject.toml)
 """
 
 from __future__ import annotations
@@ -78,8 +78,8 @@ def _sqlite_path_from_database_url(database_url: str | None) -> str:
         "postgres://"
     ):
         raise RuntimeError(
-            "Postgres backend is not implemented yet; "
-            "SQLite is the current backend (see README)."
+            "Store is the SQLite backend; use get_store() for a "
+            "postgresql:// DATABASE_URL (it returns PostgresStore)."
         )
     if database_url.startswith("sqlite:///"):
         return database_url[len("sqlite:///") :]
@@ -537,6 +537,17 @@ class Store:
         )
 
 
-def get_store() -> Store:
-    """Production store, selected from DATABASE_URL (SQLite now)."""
-    return Store(os.environ.get("DATABASE_URL"))
+def get_store():
+    """Production store, selected from DATABASE_URL.
+
+    postgresql:// or postgres:// -> PostgresStore (schema in
+    app/postgres_schema.sql, psycopg required); anything else
+    -> the SQLite Store. Endpoints never change: both stores
+    implement the same methods.
+    """
+    url = os.environ.get("DATABASE_URL")
+    if url and (url.startswith("postgresql://") or url.startswith("postgres://")):
+        from .postgres_store import PostgresStore
+
+        return PostgresStore(url)
+    return Store(url)

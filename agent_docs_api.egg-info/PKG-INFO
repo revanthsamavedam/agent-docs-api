@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: agent-docs-api
+Version: 0.1.0
+Summary: agent-docs API: publish, view, and version history for plain-HTML documents.
+Requires-Python: >=3.11
+Requires-Dist: fastapi>=0.110
+Requires-Dist: pydantic>=2.0
+Requires-Dist: uvicorn>=0.29
+Provides-Extra: test
+Requires-Dist: httpx>=0.27; extra == "test"
+Requires-Dist: pytest>=8.0; extra == "test"
+Provides-Extra: postgres
+Requires-Dist: psycopg[binary]>=3.1; extra == "postgres"
