@@ -5,3 +5,5 @@ venv/
 .pytest_cache/
 *.db
 .env
+agent_docs_api.egg-info/
+build/
