@@ -82,6 +82,25 @@ python -m venv .venv
 - `POST /v1/documents/{id}/state` — patch many keys at once
   (`{"patch": {…}}`; null values in the patch delete those keys).
 
+## API registry — onboard an internal API once, use it in any document
+
+Register an API's base URL and its per-endpoint token URL; the
+registry stores URLs only, never tokens or secrets. Documents
+refer to an API by name, and the viewer resolves its token URL
+at view time, so rotating a token URL needs no document
+republishing and no viewer redeploy.
+
+- `POST /v1/apis` — register `{name, api_url, token_url, scope?}`;
+  duplicate name returns 409, bad name or non-https URL returns 400.
+- `GET /v1/apis` — list registered APIs.
+- `GET /v1/apis/{name}` — one registered API.
+- `PUT /v1/apis/{name}` — update `api_url` / `token_url` / `scope`.
+- `DELETE /v1/apis/{name}` — remove an API.
+
+Before production, set `TRUSTED_TOKEN_URL_ORIGINS` in
+`app/main.py` to the allowed token-URL origins; it is empty in
+this build, meaning no origin restriction is enforced.
+
 Versions are immutable, carry a SHA-256 of the HTML, and a
 change summary. HTML larger than 10 MiB is rejected (413).
 

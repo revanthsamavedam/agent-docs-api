@@ -24,6 +24,25 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 
+# API registry: name -> (api_url, token_url, scope). Names are
+# slugs; URLs must be https (http only for localhost dev). The
+# registry stores URLs only — never tokens or secrets. A token
+# URL is fetched at view time, per viewer, per endpoint.
+_API_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,63}$")
+
+
+def validate_api_registration(name: str, api_url: str, token_url: str) -> None:
+    if not _API_NAME_RE.match(name):
+        raise ValueError("invalid_api_name")
+    for url in (api_url, token_url):
+        if not (
+            url.startswith("https://")
+            or url.startswith("http://127.0.0.1")
+            or url.startswith("http://localhost")
+        ):
+            raise ValueError("api_url_must_be_https")
+
+
 # Shared document state (KV), SlashDocs-style rules:
 # keys: letters/numbers/dot/underscore/colon/dash, max 128 chars;
 # values: JSON-serializable, max 64 KiB when dumped; null = delete;
@@ -134,6 +153,15 @@ class Store:
                     actor TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                     PRIMARY KEY (document_id, key)
+                );
+                CREATE TABLE IF NOT EXISTS apis (
+                    name TEXT PRIMARY KEY,
+                    api_url TEXT NOT NULL,
+                    token_url TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT '',
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
                 """
             )
@@ -325,6 +353,52 @@ class Store:
         for key, value in patch.items():
             self.set_state_value(doc_id, key, value, actor)
         return self.get_state(doc_id)
+
+    # -- API registry --------------------------------------------------
+    def register_api(self, name: str, api_url: str, token_url: str, scope: str, actor: str) -> dict | None:
+        validate_api_registration(name, api_url, token_url)
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO apis (name, api_url, token_url, scope, actor) VALUES (?, ?, ?, ?, ?)",
+                    (name, api_url, token_url, scope or "", actor),
+                )
+        except sqlite3.IntegrityError:
+            return None
+        return self.get_api(name)
+
+    def list_apis(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM apis ORDER BY name").fetchall()
+        return [dict(r) for r in rows]
+
+    def get_api(self, name: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM apis WHERE name = ?", (name,)).fetchone()
+        return dict(row) if row else None
+
+    def update_api(self, name: str, api_url: str | None, token_url: str | None, scope: str | None) -> dict | None:
+        existing = self.get_api(name)
+        if existing is None:
+            return None
+        new_api_url = api_url if api_url is not None else existing["api_url"]
+        new_token_url = token_url if token_url is not None else existing["token_url"]
+        validate_api_registration(name, new_api_url, new_token_url)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE apis SET api_url = ?, token_url = ?, scope = ?, updated_at = datetime('now')
+                WHERE name = ?
+                """,
+                (new_api_url, new_token_url, scope if scope is not None else existing["scope"], name),
+            )
+        return self.get_api(name)
+
+    def delete_api(self, name: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM apis WHERE name = ?", (name,))
+            deleted = cur.rowcount > 0
+        return deleted
 
     @staticmethod
     def _row_to_version(row: sqlite3.Row) -> Version:
