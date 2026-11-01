@@ -111,6 +111,15 @@ def test_api_registry_register_list_update_delete(client):
     r = client.post("/v1/apis", json={"name": "reports", "api_url": "https://internal-a.example/api/", "token_url": "https://internal-a.example/token", "scope": "reports.read"})
     assert r.status_code == 201, r.text
     assert r.json()["api"]["name"] == "reports"
+    # No token -> registered by user_id "anonymous".
+    assert r.json()["api"]["user_id"] == "anonymous"
+    # A bearer token stamps its value as user_id; list filters by it.
+    r = client.post("/v1/apis", json={"name": "mine", "api_url": "https://internal-a.example/api/", "token_url": "https://internal-a.example/token"}, headers={"Authorization": "Bearer user-123"})
+    assert r.status_code == 201, r.text
+    assert r.json()["api"]["user_id"] == "user-123"
+    assert [a["name"] for a in client.get("/v1/apis", params={"user_id": "user-123"}).json()["apis"]] == ["mine"]
+    assert [a["name"] for a in client.get("/v1/apis", params={"user_id": "anonymous"}).json()["apis"]] == ["reports"]
+    client.delete("/v1/apis/mine")
     # Duplicate name -> 409; bad name / non-https URL -> 400.
     assert client.post("/v1/apis", json={"name": "reports", "api_url": "https://x.example/", "token_url": "https://x.example/token"}).status_code == 409
     assert client.post("/v1/apis", json={"name": "Bad Name", "api_url": "https://x.example/", "token_url": "https://x.example/token"}).status_code == 400
@@ -168,6 +177,28 @@ def test_api_sync_from_stored_swagger_url(client, monkeypatch):
     assert r.json()["added_endpoints"] == ["/new"]
     assert r.json()["removed_endpoints"] == ["/risks"]
     assert r.json()["unchanged_endpoints"] == ["/reports"]
+
+
+def test_api_registry_user_id_migrated_from_old_actor(tmp_path):
+    # A DB created before user_id existed: old row has actor only.
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE apis (name TEXT PRIMARY KEY, api_url TEXT NOT NULL,"
+        " token_url TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '',"
+        " actor TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')),"
+        " updated_at TEXT NOT NULL DEFAULT (datetime('now')))"
+    )
+    conn.execute(
+        "INSERT INTO apis (name, api_url, token_url, actor) VALUES (?, ?, ?, ?)",
+        ("legacy", "https://old.example/api/", "https://old.example/token", "old-user"),
+    )
+    conn.commit()
+    conn.close()
+    store = Store(f"sqlite:///{db}")
+    assert store.get_api("legacy")["user_id"] == "old-user"
 
 
 def test_no_document_size_cap(client):

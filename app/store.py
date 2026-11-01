@@ -164,22 +164,32 @@ class Store:
                     token_url TEXT NOT NULL,
                     scope TEXT NOT NULL DEFAULT '',
                     actor TEXT NOT NULL,
+                    user_id TEXT NOT NULL DEFAULT 'anonymous',
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
                 """
             )
-            # Lightweight migration for DBs created before app/swagger
-            # columns existed: add them if missing, keep existing rows.
+            # Lightweight migration for DBs created before app/swagger/
+            # user_id columns existed: add them if missing, keep rows.
             cols = {r[1] for r in conn.execute("PRAGMA table_info(apis)").fetchall()}
             for col, ddl in [
                 ("app", "TEXT NOT NULL DEFAULT ''"),
                 ("swagger_url", "TEXT NOT NULL DEFAULT ''"),
                 ("endpoints", "TEXT NOT NULL DEFAULT '[]'"),
+                ("user_id", "TEXT NOT NULL DEFAULT 'anonymous'"),
             ]:
                 if col not in cols:
                     conn.execute(f"ALTER TABLE apis ADD COLUMN {col} {ddl}")
             conn.execute("UPDATE apis SET app = name WHERE app = ''")
+            # Backfill user_id from the old actor stamp, once: rows
+            # created before user_id existed carry the default
+            # 'anonymous' but a real actor. Rows already stamped with
+            # a real user_id, and genuinely anonymous rows, are left alone.
+            conn.execute(
+                "UPDATE apis SET user_id = actor "
+                "WHERE user_id = 'anonymous' AND actor <> '' AND actor <> 'anonymous'"
+            )
 
     # -- documents -----------------------------------------------------
     def create_document(
@@ -370,26 +380,40 @@ class Store:
         return self.get_state(doc_id)
 
     # -- API registry --------------------------------------------------
-    def register_api(self, name: str, api_url: str, token_url: str, scope: str, actor: str, app: str | None = None, swagger_url: str | None = None) -> dict | None:
+    def register_api(self, name: str, api_url: str, token_url: str, scope: str, user_id: str, app: str | None = None, swagger_url: str | None = None) -> dict | None:
+        """Register an API, stamped with the registering user id.
+
+        user_id is 'anonymous' when no token was supplied (see
+        _user_id in main.py). This is a record, not access control:
+        listing/filtering by user_id works, but no endpoint yet
+        restricts writes to the owning user — that needs verified
+        identity first. actor is kept in sync for backwards compat.
+        """
         validate_api_registration(name, api_url, token_url)
         if app is not None and not _API_NAME_RE.match(app):
             raise ValueError("invalid_api_name")
+        user_id = (user_id or "").strip() or "anonymous"
         try:
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT INTO apis (name, api_url, token_url, scope, actor, app, swagger_url, endpoints) VALUES (?, ?, ?, ?, ?, ?, ?, '[]')",
-                    (name, api_url, token_url, scope or "", actor, app or name, swagger_url or ""),
+                    "INSERT INTO apis (name, api_url, token_url, scope, actor, user_id, app, swagger_url, endpoints) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]')",
+                    (name, api_url, token_url, scope or "", user_id, user_id, app or name, swagger_url or ""),
                 )
         except sqlite3.IntegrityError:
             return None
         return self.get_api(name)
 
-    def list_apis(self, app: str | None = None) -> list[dict]:
+    def list_apis(self, app: str | None = None, user_id: str | None = None) -> list[dict]:
         with self._connect() as conn:
+            clauses, params = [], []
             if app:
-                rows = conn.execute("SELECT * FROM apis WHERE app = ? ORDER BY name", (app,)).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM apis ORDER BY name").fetchall()
+                clauses.append("app = ?")
+                params.append(app)
+            if user_id:
+                clauses.append("user_id = ?")
+                params.append(user_id)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = conn.execute(f"SELECT * FROM apis {where} ORDER BY name", params).fetchall()
         return [dict(r) for r in rows]
 
     def get_api(self, name: str) -> dict | None:
