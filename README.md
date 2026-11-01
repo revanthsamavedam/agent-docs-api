@@ -94,7 +94,14 @@ republishing and no viewer redeploy.
   app?, swagger_url?}`; duplicate name returns 409, bad name or
   non-https URL returns 400. `name` is the app short name
   (e.g. `refdp`); `app` defaults to `name` if not given.
-- `GET /v1/apis` — list registered APIs (`?app=refdp` filters).
+- `GET /v1/apis` — list registered APIs (`?app=refdp` and
+  `?user_id=…` filters).
+- Every registry entry is stamped with the registering `user_id`:
+  the bearer token's value when one is supplied, `anonymous`
+  when no token is present. This is a record for lookup and
+  audit, not access control — no endpoint yet restricts an
+  entry's update or delete to its registering user; that needs
+  verified identity first.
 - `GET /v1/apis/{name}` — one registered API.
 - `PUT /v1/apis/{name}` — update `api_url` / `token_url` / `scope` /
   `app` / `swagger_url`.

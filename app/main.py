@@ -9,11 +9,15 @@ mentions, notifications, grants UI, or approvals UI exist in
 this service.
 
 Auth is a placeholder seam only: the caller may send an
-Authorization header, which is passed through as ``actor`` and
-stored for audit. It is NOT verified against any identity
-provider here. The deployer wires real identity/authorization
+Authorization header, whose value is stored as the registering
+``user_id`` for audit. It is NOT verified against any identity
+provider here. In the absence of a token, user_id is
+``anonymous``. The deployer wires real identity/authorization
 in front of this service; that integration is deliberately out
 of this repo, and no identity provider is named or integrated here.
+When verified identity lands, _user_id is where the verified
+user id replaces this header passthrough — the stored user_id
+column needs no schema change.
 
 The JWT token URL is set in code below (JWT_TOKEN_URL), matching
 the CLI's TOKEN_URL. It is NOT a user-facing option or env var:
@@ -60,9 +64,10 @@ def set_store(s: Store) -> None:
     _store = s
 
 
-def _actor(authorization: str | None) -> str:
-    # Placeholder seam only: pass the header value through as an
-    # opaque actor string. Never verified here, never printed.
+def _user_id(authorization: str | None) -> str:
+    # Placeholder seam only: pass the header value through as the
+    # user id. Never verified here, never printed. No token ->
+    # "anonymous", by design, until verified identity replaces this.
     if not authorization:
         return "anonymous"
     return authorization.removeprefix("Bearer ").strip() or "anonymous"
@@ -132,7 +137,7 @@ def create_document(
     authorization: str | None = Header(default=None),
 ):
     doc, version = store().create_document(
-        req.title, req.html, req.change_summary, _actor(authorization)
+        req.title, req.html, req.change_summary, _user_id(authorization)
     )
     return {"id": doc.id, "title": doc.title, "version": _version_dict(version)}
 
@@ -165,7 +170,7 @@ def publish_version(
         raise HTTPException(status_code=404, detail="document_not_found")
     version, current = store().publish_version(
         doc_id, req.html, req.base_version_id, req.change_summary,
-        _actor(authorization),
+        _user_id(authorization),
     )
     if version is None:
         raise HTTPException(
@@ -264,7 +269,7 @@ def register_api(
 ):
     _check_token_url_origin(req.token_url)
     try:
-        api = store().register_api(req.name, req.api_url, req.token_url, req.scope, _actor(authorization), app=req.app, swagger_url=req.swagger_url)
+        api = store().register_api(req.name, req.api_url, req.token_url, req.scope, _user_id(authorization), app=req.app, swagger_url=req.swagger_url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if api is None:
@@ -273,12 +278,17 @@ def register_api(
 
 
 @app.get("/v1/apis")
-def list_apis(app: str | None = None):
-    return {"apis": store().list_apis(app=app)}
+def list_apis(app: str | None = None, user_id: str | None = None):
+    """List registry entries, optionally filtered by app and/or user_id.
+
+    Filtering is a record lookup, not access control: it does not
+    restrict who may see an entry.
+    """
+    return {"apis": store().list_apis(app=app, user_id=user_id)}
 
 
 @app.post("/v1/apis/{name}/sync")
-def sync_api(name: str, req: SyncApiRequest):
+def sync_api(name: str, req: SyncApiRequest, authorization: str | None = Header(default=None)):
     """Fetch the latest Swagger doc for an app and update its registry entry.
 
     The swagger_url is taken from the request if given, else from
@@ -317,7 +327,7 @@ def sync_api(name: str, req: SyncApiRequest):
     unchanged = [p for p in paths if p in previous]
     if existing is None:
         try:
-            api = store().register_api(name, base_url, token_url, "", "sync", app=name, swagger_url=swagger_url)
+            api = store().register_api(name, base_url, token_url, "", _user_id(authorization), app=name, swagger_url=swagger_url)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         store().update_api(name, None, None, None, endpoints=paths)
@@ -376,7 +386,7 @@ def patch_state(
 ):
     _require_document(doc_id)
     try:
-        state = store().patch_state(doc_id, req.patch, _actor(authorization))
+        state = store().patch_state(doc_id, req.patch, _user_id(authorization))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"document_id": doc_id, "state": state}
@@ -391,7 +401,7 @@ def set_state(
 ):
     _require_document(doc_id)
     try:
-        kept = store().set_state_value(doc_id, key, req.value, _actor(authorization))
+        kept = store().set_state_value(doc_id, key, req.value, _user_id(authorization))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return {"document_id": doc_id, "key": key, "deleted": not kept}
