@@ -20,24 +20,30 @@ code from it. They talk to it over HTTP.
 Documents are never React/JSX. React is viewer chrome only, in the
 ui repo.
 
-## Database: SQLite now, Postgres as the target
+## Database: SQLite for local dev, Postgres for production
 
-All database access lives in `app/store.py` behind the `Store`
-repository class. The current backend is SQLite, selected by
-`DATABASE_URL`:
+All database access lives behind a repository interface.
+SQLite (`app/store.py`) is the local default; Postgres
+(`app/postgres_store.py`, schema in `app/postgres_schema.sql`)
+is selected by `DATABASE_URL` — endpoint code does not change.
 
 ```
-# default: ./agentdocs.db
+# local default: ./agentdocs.db
 DATABASE_URL=sqlite:///./agentdocs.db
 
-# tests / ephemeral
-DATABASE_URL=sqlite:///:memory:
+# production: Postgres (needs psycopg)
+pip install agent-docs-api[postgres]   # or: pip install "psycopg[binary]>=3.1"
+DATABASE_URL=postgresql://<service-account>@<host>:5432/agentdocs
 ```
 
-A Postgres URL today raises an explicit error instead of being
-silently ignored. The Postgres target is a new `Store` implementation
-behind the same interface, selected from the same `DATABASE_URL` —
-endpoint code does not change.
+The Postgres schema script is idempotent and is run by the
+store on init, so it also migrates a database created before
+drafts / app grouping / user_id existed. It can also be run
+by hand: `psql "$DATABASE_URL" -f app/postgres_schema.sql`.
+
+Credentials never live in code: `DATABASE_URL` carries the
+already-governed DB service account, supplied by the service
+tier. Agents and users never receive DB credentials.
 
 ## Auth: placeholder seam only
 
