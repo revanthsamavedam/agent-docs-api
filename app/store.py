@@ -136,6 +136,8 @@ class Store:
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
                     actor TEXT NOT NULL,
+                    draft_html TEXT NOT NULL DEFAULT '',
+                    draft_updated_at TEXT,
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
                 CREATE TABLE IF NOT EXISTS versions (
@@ -182,6 +184,14 @@ class Store:
                 if col not in cols:
                     conn.execute(f"ALTER TABLE apis ADD COLUMN {col} {ddl}")
             conn.execute("UPDATE apis SET app = name WHERE app = ''")
+            # Migration for DBs created before drafts existed.
+            doc_cols = {r[1] for r in conn.execute("PRAGMA table_info(documents)").fetchall()}
+            for col, ddl in [
+                ("draft_html", "TEXT NOT NULL DEFAULT ''"),
+                ("draft_updated_at", "TEXT"),
+            ]:
+                if col not in doc_cols:
+                    conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {ddl}")
             # Backfill user_id from the old actor stamp, once: rows
             # created before user_id existed carry the default
             # 'anonymous' but a real actor. Rows already stamped with
@@ -223,11 +233,77 @@ class Store:
                 """
                 SELECT d.id, d.title, d.created_at,
                        (SELECT MAX(number) FROM versions v
-                         WHERE v.document_id = d.id) AS latest_version
+                         WHERE v.document_id = d.id) AS latest_version,
+                       (d.draft_html <> '') AS has_draft
                 FROM documents d ORDER BY d.created_at DESC, d.id DESC
                 """
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [{**dict(r), "has_draft": bool(r["has_draft"])} for r in rows]
+
+    # -- drafts --------------------------------------------------------
+    # A draft is an unpublished HTML snapshot for one document,
+    # viewable on the actual viewer link (?doc=<id>&draft=1) with
+    # the full bridge (apiFetch, kv, navigate) — so an author can
+    # test on the real viewer before publishing. A draft is never
+    # a version: it creates no version, appears in no version
+    # list, and is cleared when it is published. Saving a draft
+    # does not touch published versions.
+    def create_draft_document(self, title: str, html: str, actor: str) -> Document:
+        doc_id = _new_id("doc")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO documents (id, title, actor, draft_html, draft_updated_at) "
+                "VALUES (?, ?, ?, ?, datetime('now'))",
+                (doc_id, title, actor, html),
+            )
+        doc = self.get_document(doc_id)
+        assert doc is not None
+        return doc
+
+    def set_draft(self, doc_id: str, html: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE documents SET draft_html = ?, draft_updated_at = datetime('now') WHERE id = ?",
+                (html, doc_id),
+            )
+            return cur.rowcount > 0
+
+    def get_draft(self, doc_id: str) -> str | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT draft_html FROM documents WHERE id = ?", (doc_id,)
+            ).fetchone()
+        if row is None or not row["draft_html"]:
+            return None
+        return row["draft_html"]
+
+    def has_draft(self, doc_id: str) -> bool:
+        return self.get_draft(doc_id) is not None
+
+    def delete_draft(self, doc_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE documents SET draft_html = '', draft_updated_at = NULL WHERE id = ? AND draft_html <> ''",
+                (doc_id,),
+            )
+            return cur.rowcount > 0
+
+    def publish_draft(self, doc_id: str, change_summary: str, actor: str) -> Version | None:
+        """Publish the stored draft as the next version; clears it.
+
+        Returns None when there is no draft. Works for a
+        draft-only document (becomes version 1) as well as for
+        an existing document (next version, base = latest).
+        """
+        draft = self.get_draft(doc_id)
+        if draft is None:
+            return None
+        latest = self.latest_version(doc_id)
+        number = latest.number + 1 if latest else 1
+        base = latest.id if latest else None
+        version = self._insert_version(doc_id, number, draft, change_summary, base, actor)
+        self.delete_draft(doc_id)
+        return version
 
     # -- versions ------------------------------------------------------
     def _insert_version(
