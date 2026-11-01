@@ -56,13 +56,14 @@ def _row_to_version(row) -> Version:
         row["base_version_id"],
         row["actor"],
         _text(row["created_at"]),
+        s3_key=row.get("s3_key") or "",
     )
 
 
 class PostgresStore:
     """Postgres-backed repository. All SQL lives here, nowhere else."""
 
-    def __init__(self, database_url: str):
+    def __init__(self, database_url: str, blob_store=None):
         try:
             import psycopg
         except ImportError as e:  # pragma: no cover - missing optional dep
@@ -71,6 +72,9 @@ class PostgresStore:
                 "pip install agent-docs-api[postgres]"
             ) from e
         self._psycopg = psycopg
+        # Same blob rule as the SQLite store: when set, published
+        # HTML goes to the blob store and the row holds only s3_key.
+        self.blob_store = blob_store
         self.dsn = database_url
         self._init_schema()
 
@@ -198,16 +202,25 @@ class PostgresStore:
     ) -> Version:
         version_id = _new_id("ver")
         sha = hashlib.sha256(html.encode("utf-8")).hexdigest()
+        # Upload first, pointer second, same as the SQLite store.
+        s3_key = ""
+        stored_html = html
+        if self.blob_store is not None:
+            from .blob_store import version_blob_key
+
+            s3_key = version_blob_key(doc_id, version_id)
+            self.blob_store.put(s3_key, html.encode("utf-8"))
+            stored_html = ""
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     INSERT INTO versions
                       (id, document_id, number, sha256, change_summary,
-                       html, base_version_id, actor)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                       html, s3_key, base_version_id, actor)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (version_id, doc_id, number, sha, change_summary, html, base_version_id, actor),
+                    (version_id, doc_id, number, sha, change_summary, stored_html, s3_key, base_version_id, actor),
                 )
                 cur.execute("SELECT * FROM versions WHERE id = %s", (version_id,))
                 row = cur.fetchone()
@@ -247,6 +260,19 @@ class PostgresStore:
                 )
                 rows = cur.fetchall()
         return [_row_to_version(r) for r in rows]
+
+    def migrate_version_to_s3(self, doc_id: str, version_id: str, s3_key: str) -> bool:
+        """Backfill step (see app/s3_backfill.py): same contract as
+        the SQLite store — pointer swap only, after upload + hash
+        verification by the caller. Idempotent."""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE versions SET s3_key = %s, html = '' "
+                    "WHERE id = %s AND document_id = %s AND s3_key = ''",
+                    (s3_key, version_id, doc_id),
+                )
+                return cur.rowcount > 0
 
     def get_version(self, doc_id: str, version_id: str) -> Version | None:
         with self._connect() as conn:

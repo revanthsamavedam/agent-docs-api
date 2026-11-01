@@ -107,6 +107,10 @@ class Version:
     base_version_id: str | None
     actor: str
     created_at: str
+    # S3 pointer, empty when the HTML is stored inline in the row.
+    # Added last with a default so existing positional constructors
+    # keep working.
+    s3_key: str = ""
 
 
 def _new_id(prefix: str) -> str:
@@ -116,7 +120,11 @@ def _new_id(prefix: str) -> str:
 class Store:
     """SQLite-backed repository. All SQL lives here, nowhere else."""
 
-    def __init__(self, database_url: str | None = None) -> None:
+    def __init__(self, database_url: str | None = None, blob_store=None) -> None:
+        # blob_store (app.blob_store, e.g. S3BlobStore): when set,
+        # published version HTML goes to the blob store and the row
+        # holds only s3_key. When None, HTML stays inline in the row.
+        self.blob_store = blob_store
         self.path = _sqlite_path_from_database_url(database_url)
         # check_same_thread=False: FastAPI may serve from multiple threads;
         # each method opens its own short-lived connection.
@@ -147,6 +155,7 @@ class Store:
                     sha256 TEXT NOT NULL,
                     change_summary TEXT NOT NULL DEFAULT '',
                     html TEXT NOT NULL,
+                    s3_key TEXT NOT NULL DEFAULT '',
                     base_version_id TEXT,
                     actor TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -192,6 +201,10 @@ class Store:
             ]:
                 if col not in doc_cols:
                     conn.execute(f"ALTER TABLE documents ADD COLUMN {col} {ddl}")
+            # Migration for DBs created before S3 version storage.
+            ver_cols = {r[1] for r in conn.execute("PRAGMA table_info(versions)").fetchall()}
+            if "s3_key" not in ver_cols:
+                conn.execute("ALTER TABLE versions ADD COLUMN s3_key TEXT NOT NULL DEFAULT ''")
             # Backfill user_id from the old actor stamp, once: rows
             # created before user_id existed carry the default
             # 'anonymous' but a real actor. Rows already stamped with
@@ -317,13 +330,23 @@ class Store:
     ) -> Version:
         version_id = _new_id("ver")
         sha = hashlib.sha256(html.encode("utf-8")).hexdigest()
+        # Upload first, pointer second: if the upload fails, no row
+        # is created, so no row can ever point at a missing object.
+        s3_key = ""
+        stored_html = html
+        if self.blob_store is not None:
+            from .blob_store import version_blob_key
+
+            s3_key = version_blob_key(doc_id, version_id)
+            self.blob_store.put(s3_key, html.encode("utf-8"))
+            stored_html = ""
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO versions
                   (id, document_id, number, sha256, change_summary,
-                   html, base_version_id, actor)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   html, s3_key, base_version_id, actor)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     version_id,
@@ -331,7 +354,8 @@ class Store:
                     number,
                     sha,
                     change_summary,
-                    html,
+                    stored_html,
+                    s3_key,
                     base_version_id,
                     actor,
                 ),
@@ -530,11 +554,26 @@ class Store:
 
     @staticmethod
     def _row_to_version(row: sqlite3.Row) -> Version:
+        keys = row.keys()
         return Version(
             row["id"], row["document_id"], row["number"], row["sha256"],
             row["change_summary"], row["html"], row["base_version_id"],
             row["actor"], row["created_at"],
+            s3_key=row["s3_key"] if "s3_key" in keys else "",
         )
+
+    def migrate_version_to_s3(self, doc_id: str, version_id: str, s3_key: str) -> bool:
+        """Backfill step (see app/s3_backfill.py): after the caller
+        has uploaded the version's HTML to s3_key and verified its
+        hash, swap the row to the pointer and clear the inline HTML.
+        Idempotent: a row already pointing at S3 is left alone."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE versions SET s3_key = ?, html = '' "
+                "WHERE id = ? AND document_id = ? AND s3_key = ''",
+                (s3_key, version_id, doc_id),
+            )
+            return cur.rowcount > 0
 
 
 def get_store():

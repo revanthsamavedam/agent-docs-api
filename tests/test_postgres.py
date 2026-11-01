@@ -15,6 +15,7 @@ psycopg = pytest.importorskip("psycopg")
 
 from fastapi.testclient import TestClient
 
+from app.blob_store import InMemoryBlobStore, version_blob_key
 from app.main import app, set_store
 from app.postgres_store import PostgresStore
 from app.store import get_store
@@ -103,3 +104,23 @@ def test_postgres_schema_migrates_old_database():
     assert store.get_api("legacy")["user_id"] == "legacy-user"
     # Draft columns were added by the same migration.
     assert store.set_draft("doc_missing", "<html></html>") is False
+
+
+def test_postgres_s3_version_storage():
+    """Postgres + blob store: publish goes to the blob, the row
+    holds only the key, and the HTML endpoint serves it back."""
+    _drop_tables()
+    blob = InMemoryBlobStore()
+    store = PostgresStore(URL, blob_store=blob)
+    set_store(store)
+    try:
+        with TestClient(app) as client:
+            r = client.post("/v1/documents", json={"title": "PG S3", "html": HTML_V1, "change_summary": "v1"})
+            assert r.status_code == 201, r.text
+            doc_id, v1 = r.json()["id"], r.json()["version"]
+            version = store.get_version(doc_id, v1["id"])
+            assert version.s3_key == version_blob_key(doc_id, v1["id"])
+            assert version.html == ""
+            assert client.get(f"/v1/documents/{doc_id}/versions/{v1['id']}/html").text == HTML_V1
+    finally:
+        set_store(None)

@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS versions (
     sha256 TEXT NOT NULL,
     change_summary TEXT NOT NULL DEFAULT '',
     html TEXT NOT NULL,
+    s3_key TEXT NOT NULL DEFAULT '',
     base_version_id TEXT,
     actor TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS apis (
 );
 
 -- Migrations for databases created before these columns existed.
+ALTER TABLE versions ADD COLUMN IF NOT EXISTS s3_key TEXT NOT NULL DEFAULT '';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS draft_html TEXT NOT NULL DEFAULT '';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS draft_updated_at TIMESTAMPTZ;
 ALTER TABLE apis ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'anonymous';
