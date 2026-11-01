@@ -103,12 +103,20 @@ class RegisterApiRequest(BaseModel):
     api_url: str = Field(min_length=1)
     token_url: str = Field(min_length=1)
     scope: str = ""
+    app: Optional[str] = None
+    swagger_url: Optional[str] = None
 
 
 class UpdateApiRequest(BaseModel):
     api_url: Optional[str] = None
     token_url: Optional[str] = None
     scope: Optional[str] = None
+    app: Optional[str] = None
+    swagger_url: Optional[str] = None
+
+
+class SyncApiRequest(BaseModel):
+    swagger_url: Optional[str] = None
 
 
 def _check_html_size(html: str) -> None:
@@ -221,6 +229,39 @@ def _require_document(doc_id: str) -> None:
         raise HTTPException(status_code=404, detail="document_not_found")
 
 
+def fetch_swagger_doc(url: str) -> dict:
+    """Fetch an OpenAPI/Swagger doc (JSON, or YAML if PyYAML is installed).
+
+    Patchable in tests: monkeypatch app.main.fetch_swagger_doc.
+    """
+    import httpx
+
+    with httpx.Client(timeout=30, trust_env=False) as c:
+        r = c.get(url)
+        r.raise_for_status()
+        text = r.text.strip()
+    if text.startswith("{"):
+        import json as _json
+
+        return _json.loads(text)
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        raise HTTPException(status_code=400, detail="swagger_yaml_not_supported")
+    return yaml.safe_load(text)
+
+
+def _swagger_token_url(doc: dict) -> str | None:
+    schemes = (doc.get("components") or {}).get("securitySchemes") or {}
+    for scheme in schemes.values():
+        flows = (scheme or {}).get("flows") or {}
+        for flow_name in ("authorizationCode", "clientCredentials", "password", "implicit"):
+            flow = flows.get(flow_name) or {}
+            if flow.get("tokenUrl"):
+                return flow["tokenUrl"]
+    return None
+
+
 @app.post("/v1/apis", status_code=201)
 def register_api(
     req: RegisterApiRequest,
@@ -228,7 +269,7 @@ def register_api(
 ):
     _check_token_url_origin(req.token_url)
     try:
-        api = store().register_api(req.name, req.api_url, req.token_url, req.scope, _actor(authorization))
+        api = store().register_api(req.name, req.api_url, req.token_url, req.scope, _actor(authorization), app=req.app, swagger_url=req.swagger_url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if api is None:
@@ -237,8 +278,68 @@ def register_api(
 
 
 @app.get("/v1/apis")
-def list_apis():
-    return {"apis": store().list_apis()}
+def list_apis(app: str | None = None):
+    return {"apis": store().list_apis(app=app)}
+
+
+@app.post("/v1/apis/{name}/sync")
+def sync_api(name: str, req: SyncApiRequest):
+    """Fetch the latest Swagger doc for an app and update its registry entry.
+
+    The swagger_url is taken from the request if given, else from
+    the app config stored in the registry — so a later sync needs
+    no URL at all: `apis sync --app refdp`. Base URL comes from
+    servers[0].url, endpoints from paths. Token URL comes from
+    the Swagger oauth2 tokenUrl if present, else the existing
+    token URL is kept (Swagger paths alone never invent one).
+    Stale endpoints are reported, never auto-deleted.
+    """
+    existing = store().get_api(name)
+    swagger_url = req.swagger_url or (existing or {}).get("swagger_url") or ""
+    if not swagger_url:
+        raise HTTPException(status_code=400, detail="swagger_url_not_configured")
+    if existing is None and req.swagger_url is None:
+        raise HTTPException(status_code=404, detail="api_not_found")
+    try:
+        doc = fetch_swagger_doc(swagger_url)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"swagger_fetch_failed: {e}")
+    servers = doc.get("servers") or []
+    base_url = (servers[0].get("url") if servers else "") or (existing or {}).get("api_url") or ""
+    paths = sorted((doc.get("paths") or {}).keys())
+    swagger_token_url = _swagger_token_url(doc)
+    token_url = swagger_token_url or (existing or {}).get("token_url") or ""
+    if not token_url:
+        raise HTTPException(status_code=400, detail="token_url_not_found_in_swagger")
+    _check_token_url_origin(token_url)
+    import json as _json
+
+    previous = _json.loads((existing or {}).get("endpoints") or "[]") if existing else []
+    added = [p for p in paths if p not in previous]
+    removed = [p for p in previous if p not in paths]
+    unchanged = [p for p in paths if p in previous]
+    if existing is None:
+        try:
+            api = store().register_api(name, base_url, token_url, "", "sync", app=name, swagger_url=swagger_url)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        store().update_api(name, None, None, None, endpoints=paths)
+        api = store().get_api(name)
+    else:
+        token_changed = token_url != existing["token_url"]
+        api = store().update_api(name, base_url, token_url, None, swagger_url=swagger_url, endpoints=paths)
+        token_changed = token_changed
+    return {
+        "api": api,
+        "swagger_url": swagger_url,
+        "base_url": base_url,
+        "token_url_changed": (swagger_token_url is not None and existing is not None and swagger_token_url != existing["token_url"]),
+        "added_endpoints": added,
+        "removed_endpoints": removed,
+        "unchanged_endpoints": unchanged,
+    }
 
 
 @app.get("/v1/apis/{name}")
@@ -253,7 +354,7 @@ def get_api(name: str):
 def update_api(name: str, req: UpdateApiRequest):
     _check_token_url_origin(req.token_url) if req.token_url else None
     try:
-        api = store().update_api(name, req.api_url, req.token_url, req.scope)
+        api = store().update_api(name, req.api_url, req.token_url, req.scope, app=req.app, swagger_url=req.swagger_url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     if api is None:

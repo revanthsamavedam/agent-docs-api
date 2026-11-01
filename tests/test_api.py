@@ -130,6 +130,46 @@ def test_api_registry_register_list_update_delete(client):
     assert client.get("/v1/apis/reports").status_code == 404
 
 
+def test_api_sync_from_stored_swagger_url(client, monkeypatch):
+    # Register refdp with its swagger doc stored in its app config.
+    r = client.post("/v1/apis", json={"name": "refdp", "api_url": "https://old.example/api/", "token_url": "https://old.example/token", "swagger_url": "https://refdp.example/swagger.json"})
+    assert r.status_code == 201, r.text
+    assert r.json()["api"]["app"] == "refdp"
+    assert r.json()["api"]["swagger_url"] == "https://refdp.example/swagger.json"
+
+    # Sync with NO swagger_url in the request: CLI just runs `apis sync --app refdp`
+    # and the backend fetches the latest doc from the stored URL.
+    import app.main as main_mod
+
+    def fake_fetch(url):
+        assert url == "https://refdp.example/swagger.json"
+        return {
+            "servers": [{"url": "https://new.example/api/"}],
+            "paths": {"/reports": {}, "/risks": {}},
+            "components": {"securitySchemes": {"oauth": {"type": "oauth2", "flows": {"clientCredentials": {"tokenUrl": "https://new.example/token"}}}}},
+        }
+
+    monkeypatch.setattr(main_mod, "fetch_swagger_doc", fake_fetch)
+    r = client.post("/v1/apis/refdp/sync", json={})
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["base_url"] == "https://new.example/api/"
+    assert data["token_url_changed"] is True
+    assert data["added_endpoints"] == ["/reports", "/risks"]
+    assert data["api"]["api_url"] == "https://new.example/api/"
+    assert data["api"]["token_url"] == "https://new.example/token"
+    assert data["api"]["swagger_url"] == "https://refdp.example/swagger.json"
+
+    # Second sync: endpoints unchanged, one removed is reported, not deleted from docs.
+    def fake_fetch2(url):
+        return {"servers": [{"url": "https://new.example/api/"}], "paths": {"/reports": {}, "/new": {}}}
+    monkeypatch.setattr(main_mod, "fetch_swagger_doc", fake_fetch2)
+    r = client.post("/v1/apis/refdp/sync", json={})
+    assert r.json()["added_endpoints"] == ["/new"]
+    assert r.json()["removed_endpoints"] == ["/risks"]
+    assert r.json()["unchanged_endpoints"] == ["/reports"]
+
+
 def test_not_found(client):
     assert client.get("/v1/documents/doc_missing").status_code == 404
     assert client.get(

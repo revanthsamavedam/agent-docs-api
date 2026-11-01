@@ -90,12 +90,25 @@ refer to an API by name, and the viewer resolves its token URL
 at view time, so rotating a token URL needs no document
 republishing and no viewer redeploy.
 
-- `POST /v1/apis` — register `{name, api_url, token_url, scope?}`;
-  duplicate name returns 409, bad name or non-https URL returns 400.
-- `GET /v1/apis` — list registered APIs.
+- `POST /v1/apis` — register `{name, api_url, token_url, scope?,
+  app?, swagger_url?}`; duplicate name returns 409, bad name or
+  non-https URL returns 400. `name` is the app short name
+  (e.g. `refdp`); `app` defaults to `name` if not given.
+- `GET /v1/apis` — list registered APIs (`?app=refdp` filters).
 - `GET /v1/apis/{name}` — one registered API.
-- `PUT /v1/apis/{name}` — update `api_url` / `token_url` / `scope`.
+- `PUT /v1/apis/{name}` — update `api_url` / `token_url` / `scope` /
+  `app` / `swagger_url`.
 - `DELETE /v1/apis/{name}` — remove an API.
+- `POST /v1/apis/{name}/sync` — fetch the latest Swagger doc
+  and update the app's registry entry. Body `{"swagger_url": …}`
+  sets the stored swagger URL; with no body, the stored
+  `swagger_url` from the app config is used, so a later sync
+  needs no URL. Base URL comes from `servers[0].url`, endpoints
+  from `paths`, token URL from the Swagger oauth2 `tokenUrl`
+  if present else the existing token URL is kept (paths alone
+  never invent a token URL). Returns added / removed /
+  unchanged endpoints; removed endpoints are reported, never
+  auto-deleted. Swagger JSON is supported; YAML needs PyYAML.
 
 Before production, set `TRUSTED_TOKEN_URL_ORIGINS` in
 `app/main.py` to the allowed token-URL origins; it is empty in
