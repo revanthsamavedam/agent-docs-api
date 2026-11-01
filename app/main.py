@@ -56,6 +56,17 @@ def store() -> Store:
     global _store
     if _store is None:
         _store = get_store()
+    # S3 version storage is opt-in by environment: once a bucket is
+    # configured, every store created here (SQLite or Postgres)
+    # uploads published HTML to it and keeps only the key in the
+    # row. A store that already carries a blob store (tests, or a
+    # deployer that attached one) is left alone.
+    if getattr(_store, "blob_store", None) is None:
+        from .blob_store import blob_store_from_env
+
+        blob = blob_store_from_env()
+        if blob is not None:
+            _store.blob_store = blob
     return _store
 
 
@@ -91,7 +102,7 @@ def _validate_html_or_400(html: str) -> None:
 
 
 def _version_dict(v) -> dict:
-    return {
+    d = {
         "id": v.id,
         "document_id": v.document_id,
         "number": v.number,
@@ -99,6 +110,37 @@ def _version_dict(v) -> dict:
         "change_summary": v.change_summary,
         "created_at": v.created_at,
     }
+    if getattr(v, "s3_key", ""):
+        d["s3_key"] = v.s3_key
+    return d
+
+
+def _resolve_version_html(version) -> str:
+    """Version HTML, wherever it is stored.
+
+    Inline rows return their HTML directly. S3 rows are fetched
+    by the API (never by the viewer) and verified against the
+    stored SHA-256 before being served, so a corrupt or swapped
+    object can never be served as a version. A missing object or
+    a missing blob store is a server inconsistency (500), not a
+    missing version (404) — the version row itself exists.
+    """
+    if version.html:
+        return version.html
+    s3_key = getattr(version, "s3_key", "")
+    if not s3_key:
+        raise HTTPException(status_code=500, detail="version_has_no_content")
+    blob = getattr(store(), "blob_store", None)
+    if blob is None:
+        raise HTTPException(status_code=500, detail="blob_store_not_configured")
+    data = blob.get(s3_key)
+    if data is None:
+        raise HTTPException(status_code=500, detail="version_blob_not_found")
+    import hashlib
+
+    if hashlib.sha256(data).hexdigest() != version.sha256:
+        raise HTTPException(status_code=500, detail="version_blob_hash_mismatch")
+    return data.decode("utf-8")
 
 
 class CreateDocumentRequest(BaseModel):
@@ -292,7 +334,9 @@ def get_version_html(doc_id: str, version_id: str):
     if version is None:
         raise HTTPException(status_code=404, detail="version_not_found")
     # Byte-identical raw HTML. No wrapping, no rewriting.
-    return Response(content=version.html, media_type="text/html")
+    # Served by the API from inline storage or from S3 — the
+    # viewer never talks to S3 and never sees a bucket URL.
+    return Response(content=_resolve_version_html(version), media_type="text/html")
 
 
 # Trusted token-URL origins, set in code by the maintainer before

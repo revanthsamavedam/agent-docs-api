@@ -45,6 +45,47 @@ Credentials never live in code: `DATABASE_URL` carries the
 already-governed DB service account, supplied by the service
 tier. Agents and users never receive DB credentials.
 
+## Version storage: inline by default, S3 when a bucket is set
+
+Published version HTML stays inline in the database unless a
+bucket is configured. With a bucket, a publish uploads the HTML
+to S3 first and the version row holds only the object key
+(`versions.s3_key`) plus the SHA-256 it already held. The
+database stays the source of truth for which versions exist;
+S3 holds only the bytes. Endpoint code does not change.
+
+```
+pip install agent-docs-api[s3]   # or: pip install "boto3>=1.28"
+AGENT_DOCS_S3_BUCKET=<bucket>
+# optional, for S3-compatible storage / region:
+AGENT_DOCS_S3_ENDPOINT_URL=<endpoint>
+AGENT_DOCS_S3_REGION=<region>
+```
+
+Keys are `documents/<doc_id>/versions/<ver_id>.html` — one key
+per version, written once, never overwritten, so a version
+cannot drift. The bucket is private and the API's service
+account is its only reader: the API fetches the bytes after
+its own checks and verifies them against the stored SHA-256
+before serving them, so the viewer never talks to S3, never
+sees a bucket URL, and never receives a presigned URL.
+
+Drafts stay in the database by design (transient, usually
+small, and keeping them out of S3 avoids orphan objects when
+a draft is discarded). To move existing inline versions to
+S3, upload first, pointer second, via the backfill script
+(re-running it skips versions already migrated):
+
+```
+DATABASE_URL=postgresql://<service-account>@<host>:5432/agentdocs \
+AGENT_DOCS_S3_BUCKET=<bucket> \
+    python scripts/backfill_versions_to_s3.py [--dry-run]
+```
+
+Orphan objects (in S3, no database row) are not deleted by
+the backfill — list them from the bucket and check before
+deleting anything.
+
 ## Auth: placeholder seam only
 
 The API accepts an `Authorization` header and passes it through as
