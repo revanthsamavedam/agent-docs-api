@@ -3,8 +3,7 @@
 Runs only when AGENTDOCS_TEST_POSTGRES_URL is set to a throwaway
 database (the fixture drops all agent-docs tables in it first).
 Skipped otherwise, so the normal suite never needs a Postgres
-server. In this sandbox the test database is a local Postgres 16
-instance; at Wellington it is the pilot database.
+server.
 """
 
 import os
@@ -31,14 +30,17 @@ def _drop_tables():
     with psycopg.connect(URL) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "DROP TABLE IF EXISTS versions, document_kv, apis, documents CASCADE"
+                "DROP TABLE IF EXISTS api_sync_log, api_call_log, "
+                "audit_events, api_registry, document_state, "
+                "document_versions, documents CASCADE"
             )
 
 
 @pytest.fixture()
 def client():
     _drop_tables()
-    store = PostgresStore(URL)
+    # Version content is S3-only: tests attach the in-memory blob.
+    store = PostgresStore(URL, blob_store=InMemoryBlobStore())
     set_store(store)
     with TestClient(app) as c:
         yield c
@@ -51,59 +53,33 @@ def test_get_store_routes_postgresql_url(monkeypatch):
 
 
 def test_postgres_full_flow(client):
-    r = client.post("/v1/documents", json={"title": "PG report", "html": HTML_V1, "change_summary": "v1"})
+    r = client.post("/v1/documents", json={"title": "PG report", "html": HTML_V1})
     assert r.status_code == 201, r.text
     doc_id = r.json()["id"]
-    v1_id = r.json()["version"]["id"]
+    assert r.json()["version"]["number"] == 1
 
-    # Publish v2, then a stale base 409s, exactly like SQLite.
-    r = client.post(f"/v1/documents/{doc_id}/versions", json={"html": HTML_V2, "base_version_id": v1_id})
+    # Publish appends; versions are addressed by number.
+    r = client.post(f"/v1/documents/{doc_id}/versions", json={"html": HTML_V2})
     assert r.status_code == 201 and r.json()["version"]["number"] == 2
-    assert client.post(f"/v1/documents/{doc_id}/versions", json={"html": HTML_V2, "base_version_id": v1_id}).status_code == 409
-    assert client.get(f"/v1/documents/{doc_id}/versions/{v1_id}/html").text == HTML_V1
-
-    # Drafts: save, view, publish, cleared.
-    assert client.put(f"/v1/documents/{doc_id}/draft", json={"html": HTML_V1}).status_code == 200
-    assert client.get(f"/v1/documents/{doc_id}/draft").json()["html"] == HTML_V1
-    r = client.post(f"/v1/documents/{doc_id}/draft/publish", json={})
-    assert r.status_code == 201 and r.json()["version"]["number"] == 3
-    assert client.get(f"/v1/documents/{doc_id}/draft").status_code == 404
+    assert client.get(f"/v1/documents/{doc_id}/versions/1/html").text == HTML_V1
+    assert client.get(f"/v1/documents/{doc_id}/versions/2/html").text == HTML_V2
+    assert client.get(f"/v1/documents/{doc_id}/versions/99").status_code == 404
 
     # Shared state.
     assert client.put(f"/v1/documents/{doc_id}/state/checklist.done", json={"value": True}).status_code == 200
     assert client.get(f"/v1/documents/{doc_id}/state").json()["state"] == {"checklist.done": True}
 
-    # Registry, stamped by user_id, filtered by it.
-    r = client.post("/v1/apis", json={"name": "pgapp", "api_url": "https://internal.example/api/", "token_url": "https://internal.example/token"}, headers={"Authorization": "Bearer pg-user"})
+    # Registry, stamped by user_id, filtered by it; nullable token.
+    r = client.post("/v1/apis", json={"app_name": "pgapp", "base_url": "https://internal.example/api/", "token_url": "https://internal.example/token"}, headers={"Authorization": "Bearer pg-user"})
     assert r.status_code == 201, r.text
     assert r.json()["api"]["user_id"] == "pg-user"
-    assert [a["name"] for a in client.get("/v1/apis", params={"user_id": "pg-user"}).json()["apis"]] == ["pgapp"]
+    assert [a["app_name"] for a in client.get("/v1/apis", params={"user_id": "pg-user"}).json()["apis"]] == ["pgapp"]
     assert client.put("/v1/apis/pgapp", json={"token_url": "https://internal.example/new-token"}).status_code == 200
     assert client.delete("/v1/apis/pgapp").json()["deleted"] is True
 
-
-def test_postgres_schema_migrates_old_database():
-    _drop_tables()
-    with psycopg.connect(URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "CREATE TABLE documents (id TEXT PRIMARY KEY, title TEXT NOT NULL, "
-                "actor TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-            )
-            cur.execute(
-                "CREATE TABLE apis (name TEXT PRIMARY KEY, api_url TEXT NOT NULL, "
-                "token_url TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '', "
-                "actor TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
-                "updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-            )
-            cur.execute(
-                "INSERT INTO apis (name, api_url, token_url, actor) VALUES "
-                "('legacy', 'https://old.example/api/', 'https://old.example/token', 'legacy-user')"
-            )
-    store = PostgresStore(URL)
-    assert store.get_api("legacy")["user_id"] == "legacy-user"
-    # Draft columns were added by the same migration.
-    assert store.set_draft("doc_missing", "<html></html>") is False
+    # Usage beacon.
+    r = client.post("/v1/usage", json={"document_id": doc_id, "version_no": 2, "app_name": "pgapp", "method": "GET", "path": "/things?secret=1", "status_code": 200, "duration_ms": 5})
+    assert r.status_code == 201
 
 
 def test_postgres_s3_version_storage():
@@ -115,12 +91,11 @@ def test_postgres_s3_version_storage():
     set_store(store)
     try:
         with TestClient(app) as client:
-            r = client.post("/v1/documents", json={"title": "PG S3", "html": HTML_V1, "change_summary": "v1"})
+            r = client.post("/v1/documents", json={"title": "PG S3", "html": HTML_V1})
             assert r.status_code == 201, r.text
-            doc_id, v1 = r.json()["id"], r.json()["version"]
-            version = store.get_version(doc_id, v1["id"])
-            assert version.s3_key == version_blob_key(doc_id, v1["id"])
-            assert version.html == ""
-            assert client.get(f"/v1/documents/{doc_id}/versions/{v1['id']}/html").text == HTML_V1
+            doc_id = r.json()["id"]
+            version = store.get_version(doc_id, 1)
+            assert version.s3_key == version_blob_key(doc_id, 1)
+            assert client.get(f"/v1/documents/{doc_id}/versions/1/html").text == HTML_V1
     finally:
         set_store(None)

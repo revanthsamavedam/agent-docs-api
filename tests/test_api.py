@@ -1,32 +1,50 @@
-"""API tests: publish, view, version history, and shared state."""
+"""API tests: publish, view, version history, shared state,
+registry, usage beacon, and audit chain (new-schema)."""
 
 import os
+import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app.blob_store import InMemoryBlobStore, version_blob_key
 from app.main import app, set_store
-from app.store import Store
+from app.main import store as current_store
+from app.store import Store, _audit_hash
 
 HTML_V1 = "<!doctype html><html><body><h1>Report v1</h1></body></html>"
 HTML_V2 = "<!doctype html><html><body><h1>Report v2</h1></body></html>"
+HTML_V3 = "<!doctype html><html><body><h1>Report v3</h1></body></html>"
 
 
 @pytest.fixture()
 def client(tmp_path):
-    set_store(Store(f"sqlite:///{tmp_path}/test.db"))
+    # Version content is S3-only: tests attach the in-memory blob.
+    set_store(Store(f"sqlite:///{tmp_path}/test.db", blob_store=InMemoryBlobStore()))
+    with TestClient(app) as c:
+        yield c
+    set_store(None)
+
+
+@pytest.fixture()
+def plain_client(tmp_path):
+    # No blob store: publishing must fail, by design.
+    set_store(Store(f"sqlite:///{tmp_path}/plain.db"))
     with TestClient(app) as c:
         yield c
     set_store(None)
 
 
 def _create(client):
-    r = client.post(
-        "/v1/documents",
-        json={"title": "Q3 report", "html": HTML_V1, "change_summary": "v1"},
-    )
+    r = client.post("/v1/documents", json={"title": "Q3 report", "html": HTML_V1})
     assert r.status_code == 201, r.text
     return r.json()
+
+
+def _publish(client, doc_id, html):
+    r = client.post(f"/v1/documents/{doc_id}/versions", json={"html": html})
+    assert r.status_code == 201, r.text
+    return r.json()["version"]
 
 
 def test_health(client):
@@ -38,6 +56,7 @@ def test_create_list_get(client):
     doc_id = created["id"]
     assert created["version"]["number"] == 1
     assert len(created["version"]["sha256"]) == 64
+    assert created["version"]["s3_key"] == version_blob_key(doc_id, 1)
 
     docs = client.get("/v1/documents").json()["documents"]
     assert [d["id"] for d in docs] == [doc_id]
@@ -48,42 +67,41 @@ def test_create_list_get(client):
     assert got["latest_version"]["number"] == 1
 
 
-def test_publish_requires_current_base_and_old_version_is_immutable(client):
+def test_publish_appends_versions_and_old_version_is_immutable(client):
     created = _create(client)
     doc_id = created["id"]
-    v1_id = created["version"]["id"]
 
-    r = client.post(
-        f"/v1/documents/{doc_id}/versions",
-        json={"html": HTML_V2, "base_version_id": v1_id, "change_summary": "v2"},
-    )
-    assert r.status_code == 201, r.text
-    v2_id = r.json()["version"]["id"]
-    assert r.json()["version"]["number"] == 2
+    # No base version, no 409: publishes just append.
+    v2 = _publish(client, doc_id, HTML_V2)
+    assert v2["number"] == 2
+    v3 = _publish(client, doc_id, HTML_V3)
+    assert v3["number"] == 3
 
-    # Stale base -> 409 with the current version id.
-    stale = client.post(
-        f"/v1/documents/{doc_id}/versions",
-        json={"html": HTML_V2, "base_version_id": v1_id},
-    )
-    assert stale.status_code == 409
-    assert stale.json()["detail"]["current_version_id"] == v2_id
-
-    # Old version HTML is byte-identical and unchanged by the publish.
-    html_v1 = client.get(f"/v1/documents/{doc_id}/versions/{v1_id}/html")
-    assert html_v1.text == HTML_V1
-    assert html_v1.headers["content-type"].startswith("text/html")
-    html_v2 = client.get(f"/v1/documents/{doc_id}/versions/{v2_id}/html")
-    assert html_v2.text == HTML_V2
+    # Versions are addressed by NUMBER, and old HTML is untouched.
+    assert client.get(f"/v1/documents/{doc_id}/versions/1/html").text == HTML_V1
+    assert client.get(f"/v1/documents/{doc_id}/versions/2/html").text == HTML_V2
+    assert client.get(f"/v1/documents/{doc_id}/versions/3/html").text == HTML_V3
+    assert client.get(f"/v1/documents/{doc_id}/versions/1/html").headers["content-type"].startswith("text/html")
 
     versions = client.get(f"/v1/documents/{doc_id}/versions").json()["versions"]
-    assert [v["number"] for v in versions] == [1, 2]
+    assert [v["number"] for v in versions] == [1, 2, 3]
+    assert client.get(f"/v1/documents/{doc_id}/versions/2").json()["version"]["s3_key"] == version_blob_key(doc_id, 2)
+
+    # An explicit unknown version 404s — never falls back to latest.
+    assert client.get(f"/v1/documents/{doc_id}/versions/99").status_code == 404
+    assert client.get(f"/v1/documents/{doc_id}/versions/99/html").status_code == 404
+
+
+def test_publish_without_blob_store_fails(plain_client):
+    r = plain_client.post("/v1/documents", json={"title": "No blob", "html": HTML_V1})
+    assert r.status_code == 500
+    assert r.json()["detail"] == "blob_store_not_configured"
+    assert plain_client.get("/v1/documents").json()["documents"] == []
 
 
 def test_shared_state_is_document_scoped_not_version_scoped(client):
     created = _create(client)
     doc_id = created["id"]
-    v1_id = created["version"]["id"]
 
     r = client.put(f"/v1/documents/{doc_id}/state/checklist.evidence_verified", json={"value": True})
     assert r.status_code == 200, r.text
@@ -93,10 +111,7 @@ def test_shared_state_is_document_scoped_not_version_scoped(client):
     assert state == {"approval.status": "approved", "checklist.evidence_verified": True}
 
     # Publish v2: state survives, and changing state creates no version.
-    client.post(
-        f"/v1/documents/{doc_id}/versions",
-        json={"html": HTML_V2, "base_version_id": v1_id, "change_summary": "v2"},
-    )
+    _publish(client, doc_id, HTML_V2)
     assert client.get(f"/v1/documents/{doc_id}/state").json()["state"] == state
     assert len(client.get(f"/v1/documents/{doc_id}/versions").json()["versions"]) == 2
 
@@ -108,46 +123,59 @@ def test_shared_state_is_document_scoped_not_version_scoped(client):
 
 
 def test_api_registry_register_list_update_delete(client):
-    r = client.post("/v1/apis", json={"name": "reports", "api_url": "https://internal-a.example/api/", "token_url": "https://internal-a.example/token", "scope": "reports.read"})
+    r = client.post("/v1/apis", json={"app_name": "reports", "base_url": "https://internal-a.example/api/", "token_url": "https://internal-a.example/token"})
     assert r.status_code == 201, r.text
-    assert r.json()["api"]["name"] == "reports"
+    assert r.json()["api"]["app_name"] == "reports"
     # No token -> registered by user_id "anonymous".
     assert r.json()["api"]["user_id"] == "anonymous"
     # A bearer token stamps its value as user_id; list filters by it.
-    r = client.post("/v1/apis", json={"name": "mine", "api_url": "https://internal-a.example/api/", "token_url": "https://internal-a.example/token"}, headers={"Authorization": "Bearer user-123"})
+    r = client.post("/v1/apis", json={"app_name": "mine", "base_url": "https://internal-a.example/api/", "token_url": "https://internal-a.example/token"}, headers={"Authorization": "Bearer user-123"})
     assert r.status_code == 201, r.text
     assert r.json()["api"]["user_id"] == "user-123"
-    assert [a["name"] for a in client.get("/v1/apis", params={"user_id": "user-123"}).json()["apis"]] == ["mine"]
-    assert [a["name"] for a in client.get("/v1/apis", params={"user_id": "anonymous"}).json()["apis"]] == ["reports"]
+    assert [a["app_name"] for a in client.get("/v1/apis", params={"user_id": "user-123"}).json()["apis"]] == ["mine"]
+    assert [a["app_name"] for a in client.get("/v1/apis", params={"user_id": "anonymous"}).json()["apis"]] == ["reports"]
     client.delete("/v1/apis/mine")
-    # Duplicate name -> 409; bad name / non-https URL -> 400.
-    assert client.post("/v1/apis", json={"name": "reports", "api_url": "https://x.example/", "token_url": "https://x.example/token"}).status_code == 409
-    assert client.post("/v1/apis", json={"name": "Bad Name", "api_url": "https://x.example/", "token_url": "https://x.example/token"}).status_code == 400
-    assert client.post("/v1/apis", json={"name": "x", "api_url": "http://x.example/", "token_url": "https://x.example/token"}).status_code == 400
+    # Duplicate app_name -> 409; bad name / non-https URL -> 400.
+    assert client.post("/v1/apis", json={"app_name": "reports", "base_url": "https://x.example/", "token_url": "https://x.example/token"}).status_code == 409
+    assert client.post("/v1/apis", json={"app_name": "Bad Name", "base_url": "https://x.example/", "token_url": "https://x.example/token"}).status_code == 400
+    assert client.post("/v1/apis", json={"app_name": "x", "base_url": "http://x.example/", "token_url": "https://x.example/token"}).status_code == 400
+    # Slugs are lowercase, so an uppercase name is rejected — but
+    # lookups are case-insensitive (CITEXT in Postgres, NOCASE here).
+    assert client.post("/v1/apis", json={"app_name": "REPORTS", "base_url": "https://x.example/", "token_url": "https://x.example/token"}).status_code == 400
+    assert client.get("/v1/apis/REPORTS").json()["api"]["app_name"] == "reports"
 
     apis = client.get("/v1/apis").json()["apis"]
-    assert [a["name"] for a in apis] == ["reports"]
+    assert [a["app_name"] for a in apis] == ["reports"]
     assert client.get("/v1/apis/reports").json()["api"]["token_url"] == "https://internal-a.example/token"
 
     # Rotating a token URL does not require republishing documents:
     # the registry is resolved at view time.
     r = client.put("/v1/apis/reports", json={"token_url": "https://internal-a.example/new-token"})
     assert r.status_code == 200 and r.json()["api"]["token_url"] == "https://internal-a.example/new-token"
+    # Explicit null clears a nullable column; absent keeps it.
+    r = client.put("/v1/apis/reports", json={"token_url": None})
+    assert r.status_code == 200 and r.json()["api"]["token_url"] is None
     assert client.put("/v1/apis/missing", json={"token_url": "https://x.example/token"}).status_code == 404
 
-    assert client.delete("/v1/apis/reports").json()["deleted"] is True
+    assert client.delete("/v1/apis/reports").json() == {"app_name": "reports", "deleted": True}
     assert client.get("/v1/apis/reports").status_code == 404
 
 
-def test_api_sync_from_stored_swagger_url(client, monkeypatch):
-    # Register refdp with its swagger doc stored in its app config.
-    r = client.post("/v1/apis", json={"name": "refdp", "api_url": "https://old.example/api/", "token_url": "https://old.example/token", "swagger_url": "https://refdp.example/swagger.json"})
+def test_api_registry_nullable_token_url_for_apikey_schemes(client):
+    # An apiKey scheme has no token endpoint: register without one.
+    r = client.post("/v1/apis", json={"app_name": "keyed", "base_url": "https://keyed.example/api/"})
     assert r.status_code == 201, r.text
-    assert r.json()["api"]["app"] == "refdp"
+    assert r.json()["api"]["token_url"] is None
+
+
+def test_api_sync_from_stored_swagger_url(client, monkeypatch):
+    # Register refdp with its swagger doc stored in the registry.
+    r = client.post("/v1/apis", json={"app_name": "refdp", "base_url": "https://old.example/api/", "token_url": "https://old.example/token", "swagger_url": "https://refdp.example/swagger.json"})
+    assert r.status_code == 201, r.text
     assert r.json()["api"]["swagger_url"] == "https://refdp.example/swagger.json"
 
-    # Sync with NO swagger_url in the request: CLI just runs `apis sync --app refdp`
-    # and the backend fetches the latest doc from the stored URL.
+    # Sync with NO swagger_url in the request: the backend fetches
+    # the latest doc from the stored URL.
     import app.main as main_mod
 
     def fake_fetch(url):
@@ -165,11 +193,11 @@ def test_api_sync_from_stored_swagger_url(client, monkeypatch):
     assert data["base_url"] == "https://new.example/api/"
     assert data["token_url_changed"] is True
     assert data["added_endpoints"] == ["/reports", "/risks"]
-    assert data["api"]["api_url"] == "https://new.example/api/"
+    assert data["api"]["base_url"] == "https://new.example/api/"
     assert data["api"]["token_url"] == "https://new.example/token"
     assert data["api"]["swagger_url"] == "https://refdp.example/swagger.json"
 
-    # Second sync: endpoints unchanged, one removed is reported, not deleted from docs.
+    # Second sync: endpoints unchanged, one removed is reported, not deleted.
     def fake_fetch2(url):
         return {"servers": [{"url": "https://new.example/api/"}], "paths": {"/reports": {}, "/new": {}}}
     monkeypatch.setattr(main_mod, "fetch_swagger_doc", fake_fetch2)
@@ -178,27 +206,75 @@ def test_api_sync_from_stored_swagger_url(client, monkeypatch):
     assert r.json()["removed_endpoints"] == ["/risks"]
     assert r.json()["unchanged_endpoints"] == ["/reports"]
 
-
-def test_api_registry_user_id_migrated_from_old_actor(tmp_path):
-    # A DB created before user_id existed: old row has actor only.
-    import sqlite3
-
-    db = tmp_path / "old.db"
-    conn = sqlite3.connect(db)
-    conn.execute(
-        "CREATE TABLE apis (name TEXT PRIMARY KEY, api_url TEXT NOT NULL,"
-        " token_url TEXT NOT NULL, scope TEXT NOT NULL DEFAULT '',"
-        " actor TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')),"
-        " updated_at TEXT NOT NULL DEFAULT (datetime('now')))"
-    )
-    conn.execute(
-        "INSERT INTO apis (name, api_url, token_url, actor) VALUES (?, ?, ?, ?)",
-        ("legacy", "https://old.example/api/", "https://old.example/token", "old-user"),
-    )
-    conn.commit()
+    # Every sync wrote one api_sync_log row.
+    conn = sqlite3.connect(current_store().path)
+    rows = conn.execute("SELECT added, removed FROM api_sync_log ORDER BY id").fetchall()
     conn.close()
-    store = Store(f"sqlite:///{db}")
-    assert store.get_api("legacy")["user_id"] == "old-user"
+    assert rows[0][0] == 2 and rows[0][1] == "[]"
+    assert rows[1][0] == 1 and rows[1][1] == '["/risks"]'
+
+
+def test_api_sync_without_any_token_url_keeps_null(client, monkeypatch):
+    # An apiKey app's spec has no oauth2 tokenUrl and the entry has
+    # none either: sync succeeds and token_url stays null (no 400).
+    client.post("/v1/apis", json={"app_name": "keyed", "base_url": "https://keyed.example/api/", "swagger_url": "https://keyed.example/swagger.json"})
+    import app.main as main_mod
+
+    monkeypatch.setattr(
+        main_mod, "fetch_swagger_doc",
+        lambda url: {"servers": [{"url": "https://keyed.example/api/"}], "paths": {"/things": {}}},
+    )
+    r = client.post("/v1/apis/keyed/sync", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["api"]["token_url"] is None
+    assert r.json()["added_endpoints"] == ["/things"]
+
+
+def test_usage_beacon_strips_query_and_stamps_server_actor(client):
+    created = _create(client)
+    doc_id = created["id"]
+    r = client.post(
+        "/v1/usage",
+        json={"document_id": doc_id, "version_no": 1, "app_name": "reports",
+              "method": "GET", "path": "/reports/4821?ssn=123-45-6789",
+              "status_code": 200, "duration_ms": 142},
+        headers={"Authorization": "Bearer viewer-7"},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json() == {"logged": True}
+
+    conn = sqlite3.connect(current_store().path)
+    row = conn.execute("SELECT * FROM api_call_log").fetchone()
+    conn.close()
+    assert row is not None
+    # Query string never reached the log; actor came from the token.
+    assert row[5] == "/reports/4821"
+    assert row[9] == "viewer-7"
+    assert row[2] == 1 and row[4] == "GET" and row[8] == 142
+
+    # Bad method -> 400; no auth -> anonymous, still logged.
+    r = client.post("/v1/usage", json={"document_id": doc_id, "app_name": "reports", "method": "PATCH", "path": "/x", "duration_ms": 1})
+    assert r.status_code == 400
+    r = client.post("/v1/usage", json={"document_id": doc_id, "app_name": "reports", "method": "GET", "path": "/x", "error": "unregistered_app", "duration_ms": 3})
+    assert r.status_code == 201
+
+
+def test_audit_chain_verifies(client):
+    created = _create(client)
+    doc_id = created["id"]
+    _publish(client, doc_id, HTML_V2)
+    client.post("/v1/apis", json={"app_name": "reports", "base_url": "https://internal-a.example/api/"})
+
+    entries = current_store().list_audit()
+    assert [e["action"] for e in entries] == ["created", "published", "registered"]
+    # Chain replay: each hash commits to the previous hash + fields.
+    prev = None
+    for e in entries:
+        assert e["prev_hash"] == prev
+        assert e["entry_hash"] == _audit_hash(
+            prev, e["entity_type"], e["entity_id"], e["action"], e["actor"], e["details"]
+        )
+        prev = e["entry_hash"]
 
 
 def test_publish_validation_rejects_secrets_direct_fetch_external_and_react(client):
@@ -231,65 +307,25 @@ def test_publish_validation_allows_sample_pages_and_blocks_bad_new_version(clien
         assert r.status_code == 201, (name, r.text)
     # A bad new version is rejected and leaves v1 untouched.
     doc_id = client.get("/v1/documents").json()["documents"][0]["id"]
-    versions = client.get(f"/v1/documents/{doc_id}/versions").json()["versions"]
-    v1_id = versions[0]["id"]
     r = client.post(
         f"/v1/documents/{doc_id}/versions",
-        json={"html": "<html><body><script>fetch('https://x.example/');</script></body></html>", "base_version_id": v1_id},
+        json={"html": "<html><body><script>fetch('https://x.example/');</script></body></html>"},
     )
     assert r.status_code == 400
     assert len(client.get(f"/v1/documents/{doc_id}/versions").json()["versions"]) == 1
 
 
-def test_draft_save_view_publish_on_actual_link(client):
-    created = _create(client)
-    doc_id = created["id"]
-    v1_id = created["version"]["id"]
-    # Saving a draft creates no version and touches no published version.
-    r = client.put(f"/v1/documents/{doc_id}/draft", json={"html": HTML_V2})
-    assert r.status_code == 200, r.text
-    assert len(client.get(f"/v1/documents/{doc_id}/versions").json()["versions"]) == 1
-    assert client.get(f"/v1/documents/{doc_id}/versions/{v1_id}/html").text == HTML_V1
-    assert client.get(f"/v1/documents/{doc_id}/draft").json()["html"] == HTML_V2
-    assert client.get(f"/v1/documents/{doc_id}").json()["has_draft"] is True
-    # A draft with a secret is rejected by the same validation as a publish.
-    r = client.put(f"/v1/documents/{doc_id}/draft", json={"html": "<html><script>const api_key = \"abc12345\";</script></html>"})
-    assert r.status_code == 400
-    assert client.get(f"/v1/documents/{doc_id}/draft").json()["html"] == HTML_V2
-    # Publish the draft: it becomes v2, and the draft is cleared.
-    r = client.post(f"/v1/documents/{doc_id}/draft/publish", json={"change_summary": "from draft"})
-    assert r.status_code == 201, r.text
-    assert r.json()["version"]["number"] == 2
-    assert client.get(f"/v1/documents/{doc_id}/draft").status_code == 404
-    assert client.get(f"/v1/documents/{doc_id}").json()["has_draft"] is False
-
-
-def test_draft_only_document_then_publish(client):
-    r = client.post("/v1/documents", json={"title": "Draft page", "html": HTML_V1, "draft": True})
-    assert r.status_code == 201, r.text
-    doc_id = r.json()["id"]
-    assert r.json()["draft"] is True and r.json()["version"] is None
-    assert client.get(f"/v1/documents/{doc_id}/versions").json()["versions"] == []
-    docs = client.get("/v1/documents").json()["documents"]
-    assert [d for d in docs if d["id"] == doc_id][0]["has_draft"] is True
-    r = client.post(f"/v1/documents/{doc_id}/draft/publish", json={})
-    assert r.status_code == 201 and r.json()["version"]["number"] == 1
-    assert client.post(f"/v1/documents/{doc_id}/draft/publish", json={}).status_code == 404
-
-
 def test_no_document_size_cap(client):
     # No 10 MiB cap: an 11 MiB document must be accepted, not 413.
     html = "<html>" + "x" * (11 * 1024 * 1024) + "</html>"
-    r = client.post("/v1/documents", json={"title": "Big", "html": html, "change_summary": "big"})
+    r = client.post("/v1/documents", json={"title": "Big", "html": html})
     assert r.status_code == 201, r.status_code
 
 
 def test_not_found(client):
     assert client.get("/v1/documents/doc_missing").status_code == 404
-    assert client.get(
-        "/v1/documents/doc_missing/versions/ver_missing/html"
-    ).status_code == 404
+    assert client.get("/v1/documents/doc_missing/versions/1/html").status_code == 404
     assert client.post(
         "/v1/documents/doc_missing/versions",
-        json={"html": HTML_V1, "base_version_id": "ver_missing"},
+        json={"html": HTML_V1},
     ).status_code == 404

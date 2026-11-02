@@ -8,6 +8,10 @@ code from it. They talk to it over HTTP.
 
 - Agents publish plain, self-contained HTML documents.
 - Humans view documents and any past version.
+- API registry: onboard an internal API once (base URL, token
+  URL, Swagger sync); documents refer to it by app name.
+- Live-call usage log: the viewer bridge reports each apiFetch
+  for audit — never query strings, bodies, or tokens.
 - Shared document state: a document-scoped key-value store.
   State survives across versions and changing it never creates
   a version. Keys match `[A-Za-z0-9._:-]{1,128}`, values are
@@ -37,22 +41,24 @@ DATABASE_URL=postgresql://<service-account>@<host>:5432/agentdocs
 ```
 
 The Postgres schema script is idempotent and is run by the
-store on init, so it also migrates a database created before
-drafts / app grouping / user_id existed. It can also be run
-by hand: `psql "$DATABASE_URL" -f app/postgres_schema.sql`.
+store on init. It can also be run by hand:
+`psql "$DATABASE_URL" -f app/postgres_schema.sql`. It is a
+fresh schema, not a migration: databases created under the old
+schema (draft columns, version ids, inline HTML) are not
+migrated — start from an empty database.
 
 Credentials never live in code: `DATABASE_URL` carries the
 already-governed DB service account, supplied by the service
 tier. Agents and users never receive DB credentials.
 
-## Version storage: inline by default, S3 when a bucket is set
+## Version storage: S3 only
 
-Published version HTML stays inline in the database unless a
-bucket is configured. With a bucket, a publish uploads the HTML
-to S3 first and the version row holds only the object key
-(`versions.s3_key`) plus the SHA-256 it already held. The
-database stays the source of truth for which versions exist;
-S3 holds only the bytes. Endpoint code does not change.
+Published version HTML lives only in S3. A publish uploads the
+HTML first and the version row holds only the object key
+(`document_versions.s3_key`) plus the SHA-256. The database
+stays the source of truth for which versions exist; S3 holds
+only the bytes. Publishing without a blob store configured
+fails, by design — there is no inline-HTML fallback.
 
 ```
 pip install agent-docs-api[s3]   # or: pip install "boto3>=1.28"
@@ -62,29 +68,15 @@ AGENT_DOCS_S3_ENDPOINT_URL=<endpoint>
 AGENT_DOCS_S3_REGION=<region>
 ```
 
-Keys are `documents/<doc_id>/versions/<ver_id>.html` — one key
-per version, written once, never overwritten, so a version
-cannot drift. The bucket is private and the API's service
-account is its only reader: the API fetches the bytes after
-its own checks and verifies them against the stored SHA-256
-before serving them, so the viewer never talks to S3, never
-sees a bucket URL, and never receives a presigned URL.
-
-Drafts stay in the database by design (transient, usually
-small, and keeping them out of S3 avoids orphan objects when
-a draft is discarded). To move existing inline versions to
-S3, upload first, pointer second, via the backfill script
-(re-running it skips versions already migrated):
-
-```
-DATABASE_URL=postgresql://<service-account>@<host>:5432/agentdocs \
-AGENT_DOCS_S3_BUCKET=<bucket> \
-    python scripts/backfill_versions_to_s3.py [--dry-run]
-```
-
-Orphan objects (in S3, no database row) are not deleted by
-the backfill — list them from the bucket and check before
-deleting anything.
+Keys are `docs/<doc_id>/v<version_no>.html` — one key
+per version, written once, never overwritten (a retried publish
+after a version-number collision writes a new key; the orphan
+from the failed attempt is harmless). The bucket is private and
+the API's service account is its only reader: the API fetches
+the bytes after its own checks and verifies them against the
+stored SHA-256 before serving them, so the viewer never talks
+to S3, never sees a bucket URL, and never receives a presigned
+URL.
 
 ## Auth: placeholder seam only
 
@@ -109,16 +101,18 @@ python -m venv .venv
 
 ## Endpoints
 
-- `POST /v1/documents` — create from `{title, html, change_summary?}`;
+- `POST /v1/documents` — create from `{title, html}`;
   stores version 1.
 - `POST /v1/documents/{id}/versions` — publish a new version;
-  body `{html, base_version_id, change_summary?}`. A stale
-  `base_version_id` returns 409 with `current_version_id`.
+  body `{html}`. The next version number is
+  `coalesce(max(version_no), 0) + 1`; there is no base version
+  and no 409 — the `(document_id, version_no)` primary key
+  serializes races (the loser recomputes and retries once).
 - `GET /v1/documents` — list documents.
 - `GET /v1/documents/{id}` — document with its latest version.
 - `GET /v1/documents/{id}/versions` — version list (metadata only).
-- `GET /v1/documents/{id}/versions/{version_id}` — one version's metadata.
-- `GET /v1/documents/{id}/versions/{version_id}/html` — raw HTML,
+- `GET /v1/documents/{id}/versions/{number}` — one version's metadata.
+- `GET /v1/documents/{id}/versions/{number}/html` — raw HTML,
   byte-identical to what was published.
 - `GET /health` — liveness check.
 - `GET /v1/documents/{id}/state` — all shared state for a document.
@@ -128,27 +122,13 @@ python -m venv .venv
 - `DELETE /v1/documents/{id}/state/{key}` — delete one key.
 - `POST /v1/documents/{id}/state` — patch many keys at once
   (`{"patch": {…}}`; null values in the patch delete those keys).
-
-## Drafts — test on the actual viewer link before publishing
-
-A draft is an unpublished HTML snapshot for a document. It
-creates no version, appears in no version list, and saving one
-touches no published version. It is rendered in the viewer
-through the same bridge as a published version, so live data,
-state, and navigation all work while testing.
-
-- `POST /v1/documents` with `{"draft": true}` — create a
-  draft-only document (no version yet).
-- `PUT /v1/documents/{id}/draft` — save/replace a draft.
-  Validated exactly like a publish; a rejected draft stores
-  nothing.
-- `GET /v1/documents/{id}/draft` — the stored draft HTML.
-- `DELETE /v1/documents/{id}/draft` — discard a draft.
-- `POST /v1/documents/{id}/draft/publish` — publish the draft
-  as the next version (version 1 for a draft-only document);
-  clears the draft. A direct publish also clears any draft.
-- Viewer link: `?doc=<id>&draft=1`. The document list and
-  `GET /v1/documents/{id}` report `has_draft`.
+- `POST /v1/usage` — live-call usage beacon: the viewer bridge
+  reports each apiFetch here (fire-and-forget). Body
+  `{document_id, version_no?, app_name, method, path,
+  status_code?, error?, duration_ms}`; the actor comes from the
+  Authorization header, never the body, and any query string in
+  the path is stripped server-side. Bodies, headers, and tokens
+  are never stored.
 
 ## Publish-time validation — the deterministic gate
 
@@ -185,45 +165,49 @@ blocked.
 
 Register an API's base URL and its per-endpoint token URL; the
 registry stores URLs only, never tokens or secrets. Documents
-refer to an API by name, and the viewer resolves its token URL
+refer to an API by app name, and the viewer resolves its token URL
 at view time, so rotating a token URL needs no document
-republishing and no viewer redeploy.
+republishing and no viewer redeploy. The registry is per
+deployment (one database per environment); there is no env
+column, and app names must match across environment databases
+or documents break on promotion.
 
-- `POST /v1/apis` — register `{name, api_url, token_url, scope?,
-  app?, swagger_url?}`; duplicate name returns 409, bad name or
-  non-https URL returns 400. `name` is the app short name
-  (e.g. `refdp`); `app` defaults to `name` if not given.
-- `GET /v1/apis` — list registered APIs (`?app=refdp` and
-  `?user_id=…` filters).
+- `POST /v1/apis` — register `{app_name, base_url, token_url?,
+  swagger_url?}`; duplicate app_name returns 409, bad name or
+  non-https URL returns 400. `token_url` is nullable: a missing
+  token URL means no token fetch (apiKey/bearer schemes).
+- `GET /v1/apis` — list registered APIs (`?user_id=…` filter;
+  a lookup, not access control).
 - Every registry entry is stamped with the registering `user_id`:
   the bearer token's value when one is supplied, `anonymous`
   when no token is present. This is a record for lookup and
-  audit, not access control — no endpoint yet restricts an
+  audit, not access control — no endpoint restricts an
   entry's update or delete to its registering user; that needs
   verified identity first.
-- `GET /v1/apis/{name}` — one registered API.
-- `PUT /v1/apis/{name}` — update `api_url` / `token_url` / `scope` /
-  `app` / `swagger_url`.
-- `DELETE /v1/apis/{name}` — remove an API.
-- `POST /v1/apis/{name}/sync` — fetch the latest Swagger doc
+- `GET /v1/apis/{app_name}` — one registered API.
+- `PUT /v1/apis/{app_name}` — update `base_url` / `token_url` /
+  `swagger_url`. An explicitly sent null clears a nullable
+  column; an absent field keeps it.
+- `DELETE /v1/apis/{app_name}` — remove an API.
+- `POST /v1/apis/{app_name}/sync` — fetch the latest Swagger doc
   and update the app's registry entry. Body `{"swagger_url": …}`
   sets the stored swagger URL; with no body, the stored
-  `swagger_url` from the app config is used, so a later sync
-  needs no URL. Base URL comes from `servers[0].url`, endpoints
-  from `paths`, token URL from the Swagger oauth2 `tokenUrl`
-  if present else the existing token URL is kept (paths alone
-  never invent a token URL). Returns added / removed /
+  `swagger_url` is used, so a later sync needs no URL. Base URL
+  comes from `servers[0].url`, endpoints from `paths`, token URL
+  from the Swagger oauth2 `tokenUrl` if present else the existing
+  token URL is kept (paths alone never invent a token URL; a
+  missing token URL stays missing). Returns added / removed /
   unchanged endpoints; removed endpoints are reported, never
-  auto-deleted. Swagger JSON is supported; YAML needs PyYAML.
+  auto-deleted. Every sync writes one `api_sync_log` row.
+  Swagger JSON is supported; YAML needs PyYAML.
 
 Before production, set `TRUSTED_TOKEN_URL_ORIGINS` in
 `app/main.py` to the allowed token-URL origins; it is empty in
 this build, meaning no origin restriction is enforced.
 
-Versions are immutable, carry a SHA-256 of the HTML, and a
-change summary. There is no document size cap in this API:
-HTML is stored as-is, however large; storage is bounded only
-by the database / disk.
+Versions are immutable and carry a SHA-256 of the HTML. There
+is no document size cap in this API: HTML is stored as-is,
+however large; storage is bounded only by the bucket.
 
 ## Tests
 

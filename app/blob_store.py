@@ -1,27 +1,25 @@
-"""Blob storage for published version HTML (S3-backed, opt-in).
+"""Blob storage for published version HTML (S3-backed, required).
 
-When no blob store is configured, version HTML stays inline in the
-database, exactly as before. When one is configured (a bucket in
-``AGENT_DOCS_S3_BUCKET``), a published version's HTML is uploaded
-to S3 on publish and the database row holds only the object key
-(``versions.s3_key``) plus the SHA-256 it already held. The API
-serves the bytes back after its own checks — the viewer never
-talks to S3, never sees a bucket URL, and never receives a
-presigned URL (those expire, and a leaked one *is* access).
+Version content lives ONLY here: the database row holds the
+object key (``document_versions.s3_key``) plus the SHA-256.
+The API serves the bytes back after its own hash check — the
+viewer never talks to S3, never sees a bucket URL, and never
+receives a presigned URL (those expire, and a leaked one *is*
+access).
 
-Key scheme: ``documents/<doc_id>/versions/<ver_id>.html`` — one
-key per version, written once, never overwritten, so a version
-cannot drift. S3's own versioning is NOT the document history;
-the version id is.
+Key scheme: ``docs/<doc_id>/v<version_no>.html`` — one key per
+version, written once, never overwritten (a retried publish
+after a version-number collision writes a new key; the orphan
+from the failed attempt is harmless). S3's own versioning is
+NOT the document history; the version number is.
 
 Credentials: boto3's default chain (environment, IAM role, or
 the service account in the service tier). No credential is ever
 in code, in the database, or in a document. The bucket is
 private; the API's service account is its only reader.
 
-Drafts are deliberately NOT blob-stored: they are transient,
-usually small, and keeping them in the database avoids orphan
-objects when a draft is discarded.
+There is no inline-HTML fallback: publishing without a blob
+store configured fails, by design.
 """
 
 from __future__ import annotations
@@ -29,8 +27,8 @@ from __future__ import annotations
 import os
 
 
-def version_blob_key(doc_id: str, version_id: str) -> str:
-    return f"documents/{doc_id}/versions/{version_id}.html"
+def version_blob_key(doc_id: str, version_no: int) -> str:
+    return f"docs/{doc_id}/v{version_no}.html"
 
 
 class InMemoryBlobStore:
@@ -90,10 +88,11 @@ class S3BlobStore:
 
 
 def blob_store_from_env():
-    """S3BlobStore from the service environment, or None (inline mode).
+    """S3BlobStore from the service environment, or None.
 
     AGENT_DOCS_S3_BUCKET (required to enable), AGENT_DOCS_S3_ENDPOINT_URL
     (optional, for S3-compatible storage), AGENT_DOCS_S3_REGION (optional).
+    None means publishing fails: version content is S3-only.
     """
     bucket = os.environ.get("AGENT_DOCS_S3_BUCKET")
     if not bucket:
